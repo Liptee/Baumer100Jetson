@@ -17,7 +17,9 @@ import datetime as dt
 import fcntl
 import json
 import math
+import os
 import queue
+import re
 import shutil
 import socket
 import struct
@@ -1229,10 +1231,165 @@ class CameraWorker(threading.Thread):
                     continue
         return "UNKNOWN"
 
+    @staticmethod
+    def _extract_serial_hint(text: str) -> str:
+        m = re.search(r"(\d{6,})", str(text or ""))
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _find_usb_root_for_video(video_name: str) -> Path | None:
+        base = Path("/sys/class/video4linux") / video_name / "device"
+        try:
+            node = base.resolve()
+        except Exception:
+            return None
+        while True:
+            if (node / "idVendor").exists() and (node / "idProduct").exists():
+                return node
+            if node.parent == node:
+                return None
+            node = node.parent
+
+    def _find_uvc_video_candidates(self) -> list[str]:
+        candidates: list[str] = []
+        serial_hint = self._extract_serial_hint(self.camera_ip)
+        for video in sorted(Path("/sys/class/video4linux").glob("video*")):
+            name = video.name
+            root = self._find_usb_root_for_video(name)
+            if root is None:
+                continue
+            try:
+                vid = (root / "idVendor").read_text(encoding="utf-8", errors="ignore").strip().lower()
+                pid = (root / "idProduct").read_text(encoding="utf-8", errors="ignore").strip().lower()
+            except Exception:
+                continue
+            # Prefer TIS camera from logs (199e:9405), but allow serial match override.
+            serial = ""
+            try:
+                serial = (root / "serial").read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                serial = ""
+            product = ""
+            try:
+                product = (root / "product").read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                product = ""
+            is_tis = (vid == "199e")
+            serial_ok = bool(serial_hint and serial_hint in serial)
+            if not (is_tis or serial_ok or ("imaging source" in product.lower())):
+                continue
+            dev = f"/dev/{name}"
+            if os.path.exists(dev):
+                candidates.append(dev)
+        # Fallback: any /dev/video* if strict matching failed.
+        if not candidates:
+            for video in sorted(Path("/sys/class/video4linux").glob("video*")):
+                dev = f"/dev/{video.name}"
+                if os.path.exists(dev):
+                    candidates.append(dev)
+        return candidates
+
+    def _try_open_uvc_capture(self, target_fps: float) -> tuple[object | None, str]:
+        if cv2 is None:
+            return None, ""
+        candidates = self._find_uvc_video_candidates()
+        for dev in candidates:
+            cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                continue
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            except Exception:
+                pass
+            # MJPG often reduces USB bandwidth pressure on UVC.
+            try:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            except Exception:
+                pass
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+            ok = False
+            for _ in range(8):
+                ret, frm = cap.read()
+                if ret and frm is not None and hasattr(frm, "shape") and len(frm.shape) >= 2:
+                    ok = True
+                    break
+            if ok:
+                return cap, dev
+            try:
+                cap.release()
+            except Exception:
+                pass
+        return None, ""
+
+    def _run_uvc_fallback_loop(self, target_fps: float) -> bool:
+        if cv2 is None or np is None:
+            self._emit("status", "UVC fallback unavailable: OpenCV/NumPy missing")
+            return False
+        cap, dev = self._try_open_uvc_capture(target_fps)
+        if cap is None:
+            self._emit("status", "UVC fallback failed: no readable /dev/video device")
+            return False
+        self._emit("status", f"UVC fallback active on {dev}")
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            self._emit(
+                "connected",
+                {
+                    "vendor": "UVC",
+                    "model": "The Imaging Source",
+                    "serial": self._extract_serial_hint(self.camera_ip),
+                    "pixel_format": "BGR8(UVC)",
+                    "payload": max(0, w * h * 3),
+                    "controls": None,
+                    "runtime": {"fps_requested": float(target_fps), "fps_reported": fps},
+                },
+            )
+            while not self.stop_event.is_set():
+                while True:
+                    try:
+                        cmd, value = self.cmd_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        if cmd == "set_exposure" and value is not None:
+                            cap.set(cv2.CAP_PROP_EXPOSURE, float(value))
+                            self._emit("status", f"UVC exposure set request: {float(value):.1f}")
+                        elif cmd == "set_gain" and value is not None:
+                            cap.set(cv2.CAP_PROP_GAIN, float(value))
+                            self._emit("status", f"UVC gain set request: {float(value):.2f}")
+                    except Exception:
+                        pass
+                ret, frm = cap.read()
+                if not ret or frm is None:
+                    self._emit("status", "UVC read timeout")
+                    continue
+                try:
+                    hh, ww = int(frm.shape[0]), int(frm.shape[1])
+                    raw = np.ascontiguousarray(frm).tobytes()
+                    self._emit("frame", FramePacket(ww, hh, 0, raw, time.time(), {"pixel_format_name": "BGR8"}))
+                except Exception as exc:
+                    self._emit("status", f"UVC frame decode error: {exc}")
+            return True
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
     def run(self) -> None:
         camera = None
         stream = None
         disconnect_reason = ""
+        switch_to_uvc_fallback = False
+        target_fps = 100.0
         try:
             import gi
 
@@ -1301,7 +1458,6 @@ class CameraWorker(threading.Thread):
             except Exception:
                 pass
             self._set_auto_controls_off(camera)
-            target_fps = 100.0
             if not is_gige:
                 try:
                     self._optimize_usb_100fps_mode(camera, target_fps)
@@ -1500,8 +1656,23 @@ class CameraWorker(threading.Thread):
                             except Exception:
                                 pass
                             bad_status_streak = 0
+                        if (
+                            (not is_gige)
+                            and emergency_mode_applied
+                            and good_frame_count == 0
+                            and bad_status_streak >= 28
+                        ):
+                            self._emit("status", "Aravis USB stream failed, switching to UVC fallback backend")
+                            switch_to_uvc_fallback = True
+                            try:
+                                camera.stop_acquisition()
+                            except Exception:
+                                pass
+                            break
                     self._maybe_restart_acquisition(camera, f"buffer status {status}", now_bad)
                 stream.push_buffer(buffer)
+                if switch_to_uvc_fallback:
+                    break
         except Exception as exc:
             disconnect_reason = str(exc)
             self._emit("error", str(exc))
@@ -1511,7 +1682,13 @@ class CameraWorker(threading.Thread):
                     camera.stop_acquisition()
                 except Exception:
                     pass
-            if disconnect_reason:
+            if switch_to_uvc_fallback:
+                ok = self._run_uvc_fallback_loop(target_fps)
+                if not ok:
+                    self._emit("disconnected", {"reason": "UVC fallback failed"})
+                else:
+                    self._emit("disconnected", None)
+            elif disconnect_reason:
                 self._emit("disconnected", {"reason": disconnect_reason})
             else:
                 self._emit("disconnected", None)
