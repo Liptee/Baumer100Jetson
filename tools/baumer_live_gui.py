@@ -948,13 +948,27 @@ class CameraWorker(threading.Thread):
     def run(self) -> None:
         camera = None
         stream = None
+        disconnect_reason = ""
         try:
             import gi
 
-            gi.require_version("Aravis", "0.8")
+            aravis_version = ""
+            last_err: Exception | None = None
+            for ver in ("0.8", "0.6", "0.4"):
+                try:
+                    gi.require_version("Aravis", ver)
+                    aravis_version = ver
+                    break
+                except Exception as exc:
+                    last_err = exc
+            if not aravis_version:
+                raise RuntimeError(f"Aravis typelib not available (tried 0.8/0.6/0.4): {last_err}")
             from gi.repository import Aravis  # type: ignore
 
-            configure_aravis_gige_interface(Aravis, self.interface)
+            self._emit("status", f"Using Aravis {aravis_version}")
+            is_gige = bool(is_ipv4_literal(self.camera_ip) or ("gev" in self.camera_ip.lower()) or ("gige" in self.camera_ip.lower()))
+            if is_gige and self.interface:
+                configure_aravis_gige_interface(Aravis, self.interface)
             try:
                 Aravis.update_device_list()
             except Exception:
@@ -966,38 +980,49 @@ class CameraWorker(threading.Thread):
                 self._emit("status", f"Connect note: {open_note}")
             self._try_take_control(camera)
 
-            camera.gv_set_stream_options(Aravis.GvStreamOption.PACKET_SOCKET_DISABLED)
-            camera.gv_set_packet_size_adjustment(Aravis.GvPacketSizeAdjustment.NEVER)
-            if self.packet_size > 0:
-                camera.gv_set_packet_size(self.packet_size)
+            if is_gige:
+                try:
+                    camera.gv_set_stream_options(Aravis.GvStreamOption.PACKET_SOCKET_DISABLED)
+                except Exception:
+                    pass
+                try:
+                    camera.gv_set_packet_size_adjustment(Aravis.GvPacketSizeAdjustment.NEVER)
+                except Exception:
+                    pass
+                if self.packet_size > 0:
+                    try:
+                        camera.gv_set_packet_size(self.packet_size)
+                    except Exception:
+                        pass
 
             stream = camera.create_stream(None, None)
             if stream is None:
                 raise RuntimeError("Failed to create stream")
 
-            if_ip = get_interface_ipv4_for_peer(self.interface, self.camera_ip)
-            if if_ip:
-                try:
-                    if hasattr(stream, "get_port"):
-                        camera.set_integer("GevSCPHostPort", int(stream.get_port()))
-                except Exception:
-                    pass
-                try:
-                    camera.set_integer("GevSCDA", ipv4_to_u32(if_ip))
-                except Exception:
-                    pass
+            if is_gige and self.interface:
+                if_ip = get_interface_ipv4_for_peer(self.interface, self.camera_ip)
+                if if_ip:
+                    try:
+                        if hasattr(stream, "get_port"):
+                            camera.set_integer("GevSCPHostPort", int(stream.get_port()))
+                    except Exception:
+                        pass
+                    try:
+                        camera.set_integer("GevSCDA", ipv4_to_u32(if_ip))
+                    except Exception:
+                        pass
 
             try:
                 camera.set_string("TriggerMode", "Off")
             except Exception:
                 pass
             self._set_auto_controls_off(camera)
-            if self.packet_size > 0:
+            if is_gige and self.packet_size > 0:
                 try:
                     camera.set_integer("GevSCPSPacketSize", int(self.packet_size))
                 except Exception:
                     pass
-            if self.packet_delay > 0:
+            if is_gige and self.packet_delay > 0:
                 try:
                     camera.set_integer("GevSCPD", int(self.packet_delay))
                 except Exception:
@@ -1097,6 +1122,7 @@ class CameraWorker(threading.Thread):
                     self._maybe_restart_acquisition(camera, f"buffer status {status}", now_bad)
                 stream.push_buffer(buffer)
         except Exception as exc:
+            disconnect_reason = str(exc)
             self._emit("error", str(exc))
         finally:
             if camera is not None:
@@ -1104,7 +1130,10 @@ class CameraWorker(threading.Thread):
                     camera.stop_acquisition()
                 except Exception:
                     pass
-            self._emit("disconnected", None)
+            if disconnect_reason:
+                self._emit("disconnected", {"reason": disconnect_reason})
+            else:
+                self._emit("disconnected", None)
 
 
 class BaumerLiveApp(tk.Tk):
@@ -3381,7 +3410,10 @@ class BaumerLiveApp(tk.Tk):
                     self.status_var.set(f"Error: {payload}")
                 elif kind == "disconnected":
                     self._stop_video_recording(silent=True)
-                    self.status_var.set("Disconnected")
+                    if isinstance(payload, dict) and payload.get("reason"):
+                        self.status_var.set(f"Disconnected: {payload.get('reason')}")
+                    else:
+                        self.status_var.set("Disconnected")
                     self.calibration_active = False
                     self.calibration_drag_active = False
                     self.calibration_stage = 0
@@ -3450,16 +3482,41 @@ class BaumerLiveApp(tk.Tk):
             or (pixel_format_to_name(frame.pixel_format) if pixel_format_to_name is not None else "")
         )
         pf_upper = pixel_format_name.upper()
+        is_rgb8 = ("RGB8" in pf_upper) or ("BGR8" in pf_upper)
+        is_raw_high_bit = ("BAYER" in pf_upper or "MONO" in pf_upper) and (
+            ("10" in pf_upper) or ("12" in pf_upper) or ("14" in pf_upper) or ("16" in pf_upper)
+        )
 
         use_scientific_preview = bool(
             FAST_PREVIEW_AVAILABLE
             and SCIENTIFIC_CAPTURE_AVAILABLE
             and decode_buffer_to_ndarray is not None
             and make_preview_from_raw is not None
-            and ("12" in pf_upper or "10" in pf_upper or len(frame.raw) >= expected * 2)
+            and is_raw_high_bit
         )
 
-        if use_scientific_preview:
+        if FAST_PREVIEW_AVAILABLE and is_rgb8 and len(frame.raw) >= expected * 3:
+            try:
+                rgb = np.frombuffer(frame.raw[: expected * 3], dtype=np.uint8).reshape((frame.height, frame.width, 3))
+                if "BGR8" in pf_upper:
+                    rgb = rgb[:, :, ::-1]
+                img = Image.fromarray(rgb, mode="RGB")
+                if rot:
+                    img = _rotate_pil_for_deg(img, rot)
+                if abs(zoom - 1.0) > 1e-6:
+                    zw = max(1, int(round(img.width * zoom)))
+                    zh = max(1, int(round(img.height * zoom)))
+                    img = img.resize((zw, zh), resample=Image.Resampling.NEAREST)
+                out_w = int(img.width)
+                out_h = int(img.height)
+                mode_label = "RGB"
+                if np is not None:
+                    record_rgb = np.asarray(img, dtype=np.uint8)
+                photo = ImageTk.PhotoImage(img)
+            except Exception as exc:
+                self.status_var.set(f"RGB preview decode error: {exc}")
+                return
+        elif use_scientific_preview:
             try:
                 raw_array = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format_name or frame.pixel_format)
                 rgb_preview = make_preview_from_raw(raw_array, pixel_format_name or frame.pixel_format, 960, 640)
