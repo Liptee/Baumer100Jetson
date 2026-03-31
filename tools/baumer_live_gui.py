@@ -5,7 +5,6 @@ Live viewer for Baumer camera on macOS.
 Features:
 - Live preview
 - Gain / Exposure Time controls
-- Snapshot saving
 - Camera auto-scan and auto-connect
 - Video recording
 """
@@ -36,7 +35,7 @@ SIOCGIFADDR = 0xC0206921
 DEFAULT_PACKET_SIZE = 1440
 DEFAULT_PACKET_DELAY = 1000
 DEFAULT_PREVIEW_FPS = 100.0
-DEFAULT_UI_POLL_MS = 10
+DEFAULT_UI_POLL_MS = 5
 DEFAULT_PREVIEW_MAX_W = 640
 DEFAULT_PREVIEW_MAX_H = 480
 
@@ -788,8 +787,8 @@ class CameraWorker(threading.Thread):
 
     def _emit(self, kind: str, payload: object | None = None) -> None:
         if kind == "frame":
-            # Keep frame latency low on low-power devices by dropping stale frames aggressively.
-            if self.event_q.qsize() > 1:
+            # Keep memory bounded; allow a deeper queue so recorder can keep up at 100 fps.
+            if self.event_q.qsize() > 384:
                 return
         try:
             self.event_q.put_nowait((kind, payload))
@@ -848,6 +847,45 @@ class CameraWorker(threading.Thread):
             camera.set_string("TriggerMode", "Off")
         except Exception:
             pass
+
+    def _set_target_frame_rate(self, camera, fps: float) -> None:
+        target = float(max(1.0, min(240.0, fps)))
+        enabled = False
+        for on in (True, 1, "True", "true", "On", "on"):
+            for setter in ("set_boolean", "set_integer", "set_string"):
+                fn = getattr(camera, setter, None)
+                if not callable(fn):
+                    continue
+                try:
+                    fn("AcquisitionFrameRateEnable", on)
+                    enabled = True
+                    break
+                except Exception:
+                    continue
+            if enabled:
+                break
+        for setter in ("set_frame_rate",):
+            fn = getattr(camera, setter, None)
+            if callable(fn):
+                try:
+                    fn(target)
+                    return
+                except Exception:
+                    pass
+        for setter in ("set_float", "set_integer", "set_string"):
+            fn = getattr(camera, setter, None)
+            if not callable(fn):
+                continue
+            try:
+                if setter == "set_string":
+                    fn("AcquisitionFrameRate", f"{target:.3f}")
+                elif setter == "set_integer":
+                    fn("AcquisitionFrameRate", int(round(target)))
+                else:
+                    fn("AcquisitionFrameRate", float(target))
+                return
+            except Exception:
+                continue
 
     def _try_take_control(self, camera) -> None:
         try:
@@ -926,20 +964,8 @@ class CameraWorker(threading.Thread):
             self._write_with_recovery(camera, "set_exposure", lambda: camera.set_exposure_time(exposure))
             self._emit("status", f"Exposure set to {value:.1f} us")
         elif cmd == "configure_profile" and value is not None:
-            if not SCIENTIFIC_CAPTURE_AVAILABLE or profile_from_dict is None or configure_scientific_mode is None:
-                self._emit("status", "Scientific mode configuration is unavailable")
-                return
-            if not isinstance(value, dict):
-                self._emit("status", "Scientific mode config error: invalid profile payload")
-                return
-            try:
-                profile = profile_from_dict(value)
-                result = configure_scientific_mode(camera, profile, logger=lambda m: self._emit("status", m))
-                self._emit("camera_config", result)
-                self._emit("status", f"Scientific mode ready: PixelFormat={result.get('selected_pixel_format')}")
-            except Exception as exc:
-                self._emit("status", f"Scientific mode config failed: {exc}")
-                return
+            self._emit("status", "Scientific profile configuration is disabled in recording mode")
+            return
         elif cmd == "refresh_controls":
             pass
         else:
@@ -1047,6 +1073,10 @@ class CameraWorker(threading.Thread):
             except Exception:
                 pass
             self._set_auto_controls_off(camera)
+            try:
+                self._set_target_frame_rate(camera, 100.0)
+            except Exception:
+                pass
             if is_gige and self.packet_size > 0:
                 try:
                     camera.set_integer("GevSCPSPacketSize", int(self.packet_size))
@@ -1072,6 +1102,11 @@ class CameraWorker(threading.Thread):
                 serial = str(camera.get_device_serial_number())
             except Exception:
                 pass
+            pixel_format_name = ""
+            try:
+                pixel_format_name = str(camera.get_pixel_format_as_string())
+            except Exception:
+                pixel_format_name = ""
 
             self._emit(
                 "connected",
@@ -1079,7 +1114,7 @@ class CameraWorker(threading.Thread):
                     "vendor": str(camera.get_vendor_name()),
                     "model": str(camera.get_model_name()),
                     "serial": serial,
-                    "pixel_format": str(camera.get_pixel_format_as_string()),
+                    "pixel_format": pixel_format_name,
                     "payload": payload,
                     "controls": controls,
                     "runtime": runtime_meta,
@@ -1094,8 +1129,6 @@ class CameraWorker(threading.Thread):
             now_mono = time.monotonic()
             self._last_good_frame_ts = now_mono
             self._last_restart_ts = now_mono
-            frame_counter = 0
-            runtime_cache = runtime_meta if isinstance(runtime_meta, dict) else {}
 
             success_status = int(Aravis.BufferStatus.SUCCESS)
             while not self.stop_event.is_set():
@@ -1120,26 +1153,7 @@ class CameraWorker(threading.Thread):
                         w = int(buffer.get_image_width())
                         h = int(buffer.get_image_height())
                         pf = int(buffer.get_image_pixel_format())
-                        frame_counter += 1
-                        if read_camera_runtime_metadata is not None and (frame_counter % 15) == 0:
-                            try:
-                                runtime_cache = read_camera_runtime_metadata(camera)
-                            except Exception:
-                                pass
-                        meta = read_buffer_metadata(buffer) if read_buffer_metadata is not None else {}
-                        if isinstance(meta, dict):
-                            meta["width"] = w
-                            meta["height"] = h
-                            meta["pixel_format_int"] = pf
-                            if "pixel_format_name" not in meta:
-                                try:
-                                    meta["pixel_format_name"] = str(camera.get_pixel_format_as_string())
-                                except Exception:
-                                    pass
-                            if isinstance(runtime_cache, dict):
-                                for key in ("exposure_us", "gain_db", "black_level"):
-                                    if key in runtime_cache:
-                                        meta[key] = runtime_cache.get(key)
+                        meta = {"pixel_format_name": pixel_format_name} if pixel_format_name else None
                         self._last_good_frame_ts = time.monotonic()
                         self._emit("frame", FramePacket(w, h, pf, raw, time.time(), meta))
                     except Exception as exc:
@@ -1206,7 +1220,7 @@ class BaumerLiveApp(tk.Tk):
         self.exposure_bounds = (100.0, 500000.0)
 
         self.worker: CameraWorker | None = None
-        self.event_q: queue.Queue = queue.Queue(maxsize=64)
+        self.event_q: queue.Queue = queue.Queue(maxsize=512)
         self.cmd_q: queue.Queue = queue.Queue(maxsize=64)
         self.last_frame: FramePacket | None = None
         self.preview_photo: tk.PhotoImage | None = None
@@ -1215,7 +1229,7 @@ class BaumerLiveApp(tk.Tk):
         self.ui_poll_ms = max(5, int(ui_poll_ms))
         self.packet_size = max(576, int(packet_size))
         self.packet_delay = max(0, int(packet_delay))
-        self.max_events_per_poll = 24
+        self.max_events_per_poll = 240
         self.auto_fix_running = False
         self.auto_connect_after_find_fix = False
         self.camera_scan_running = False
@@ -1277,13 +1291,23 @@ class BaumerLiveApp(tk.Tk):
         self.geometry_capture_btn_var = tk.StringVar(value="Capture chess frame 1/10")
         self.geometry_board_cols_var = tk.StringVar(value="9")
         self.geometry_board_rows_var = tk.StringVar(value="6")
+        self.preview_enabled = False
         self.video_recording = False
         self.video_writer = None
         self.video_path: Path | None = None
         self.video_frames_written = 0
+        self.video_frames_enqueued = 0
+        self.video_frames_dropped = 0
+        self.video_write_fps = 0.0
+        self.video_target_fps = 100.0
+        self.video_input_shape: tuple[int, int] | None = None
+        self.video_is_color = False
+        self.video_encoder_name = "unknown"
+        self.video_queue: queue.Queue = queue.Queue(maxsize=512)
+        self.video_stop_event = threading.Event()
+        self.video_writer_thread: threading.Thread | None = None
 
         self._build_ui()
-        self._on_profile_change(None)  # initialize frame count from selected profile
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(self.ui_poll_ms, self._poll_events)
         self.after(150, self._startup_connect)
@@ -1308,9 +1332,8 @@ class BaumerLiveApp(tk.Tk):
         ttk.Button(top, text="Connect", command=self._connect).grid(row=0, column=3, padx=4)
         ttk.Button(top, text="Disconnect", command=self._disconnect).grid(row=0, column=4, padx=4)
         ttk.Button(top, text="Refresh Controls", command=self._refresh_controls).grid(row=0, column=5, padx=4)
-        ttk.Button(top, text="Snapshot RAW", command=self._snapshot_scientific).grid(row=0, column=6, padx=4)
-        ttk.Button(top, text="Start REC", command=self._start_video_recording).grid(row=0, column=7, padx=4)
-        ttk.Button(top, text="Stop REC", command=self._stop_video_recording).grid(row=0, column=8, padx=4)
+        ttk.Button(top, text="Start REC", command=self._start_video_recording).grid(row=0, column=6, padx=4)
+        ttk.Button(top, text="Stop REC", command=self._stop_video_recording).grid(row=0, column=7, padx=4)
 
         center_area = ttk.Frame(root)
         center_area.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
@@ -1325,7 +1348,6 @@ class BaumerLiveApp(tk.Tk):
         self.preview_canvas = tk.Canvas(preview_frame, background="#101010", highlightthickness=0)
         self.preview_canvas.grid(row=0, column=0, sticky="nsew")
         self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
-        self.preview_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas_image_id = self.preview_canvas.create_image(0, 0, anchor="center")
         self.canvas_text_id = self.preview_canvas.create_text(
             0,
@@ -1398,82 +1420,21 @@ class BaumerLiveApp(tk.Tk):
         self.exposure_entry.bind("<KeyRelease>", self._on_exposure_entry_edit)
 
         ttk.Separator(right).grid(row=6, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Label(right, text="Preview Zoom").grid(row=7, column=0, sticky="w", padx=8)
-        zoom_row = ttk.Frame(right)
-        zoom_row.grid(row=8, column=0, padx=8, pady=(2, 8), sticky="ew")
-        zoom_row.columnconfigure(1, weight=1)
-        ttk.Button(zoom_row, text="-", width=3, command=self._zoom_out).grid(row=0, column=0)
-        self.zoom_scale = ttk.Scale(
-            zoom_row,
-            from_=0.25,
-            to=4.0,
-            variable=self.zoom_var,
-            orient=tk.HORIZONTAL,
-            length=170,
-            command=self._on_zoom_slide,
+        ttk.Label(right, text="Camera").grid(row=7, column=0, sticky="w", padx=8)
+        ttk.Label(right, textvariable=self.info_var, wraplength=280, justify="left").grid(
+            row=8, column=0, sticky="w", padx=8, pady=(2, 8)
         )
-        self.zoom_scale.grid(row=0, column=1, padx=6, sticky="ew")
-        ttk.Button(zoom_row, text="+", width=3, command=self._zoom_in).grid(row=0, column=2)
-        self.zoom_entry = ttk.Entry(zoom_row, textvariable=self.zoom_entry_var, width=7)
-        self.zoom_entry.grid(row=0, column=3, padx=(6, 0))
-        self.zoom_entry.bind("<Return>", self._apply_zoom_from_event)
-        ttk.Button(zoom_row, text="Set", command=self._apply_zoom_from_entry).grid(row=0, column=4, padx=(6, 0))
 
-        ttk.Label(right, text="Preview Rotation").grid(row=9, column=0, sticky="w", padx=8)
-        rot_row = ttk.Frame(right)
-        rot_row.grid(row=10, column=0, padx=8, pady=(2, 8), sticky="ew")
-        rot_row.columnconfigure(1, weight=1)
-        ttk.Button(rot_row, text="Left", width=6, command=self._rotate_left).grid(row=0, column=0)
-        self.rotation_combo = ttk.Combobox(
-            rot_row,
-            textvariable=self.rotation_var,
-            state="readonly",
-            values=("0", "90", "180", "270"),
-            width=8,
+        ttk.Label(right, text="Frame / Recorder").grid(row=9, column=0, sticky="w", padx=8)
+        ttk.Label(right, textvariable=self.frame_var, wraplength=280, justify="left").grid(
+            row=10, column=0, sticky="w", padx=8, pady=(2, 8)
         )
-        self.rotation_combo.grid(row=0, column=1, padx=6, sticky="w")
-        self.rotation_combo.bind("<<ComboboxSelected>>", self._on_rotation_change)
-        ttk.Button(rot_row, text="Right", width=6, command=self._rotate_right).grid(row=0, column=2)
 
         ttk.Separator(right).grid(row=11, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Label(right, text="Camera").grid(row=12, column=0, sticky="w", padx=8)
-        ttk.Label(right, textvariable=self.info_var, wraplength=280, justify="left").grid(row=13, column=0, sticky="w", padx=8, pady=(2, 8))
-
-        ttk.Label(right, text="Frame").grid(row=14, column=0, sticky="w", padx=8)
-        ttk.Label(right, textvariable=self.frame_var, wraplength=280, justify="left").grid(row=15, column=0, sticky="w", padx=8, pady=(2, 8))
-
-        ttk.Separator(right).grid(row=16, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Label(right, text="Status").grid(row=17, column=0, sticky="w", padx=8)
-        ttk.Label(right, textvariable=self.status_var, wraplength=280, justify="left").grid(row=18, column=0, sticky="w", padx=8, pady=(2, 8))
-
-        ttk.Separator(right).grid(row=19, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Label(right, text="Scientific Capture").grid(row=20, column=0, sticky="w", padx=8)
-        ttk.Label(right, text="Profile").grid(row=21, column=0, sticky="w", padx=8)
-        self.profile_combo = ttk.Combobox(
-            right,
-            textvariable=self.capture_profile_var,
-            values=self.profile_names,
-            state="readonly",
-            width=28,
+        ttk.Label(right, text="Status").grid(row=12, column=0, sticky="w", padx=8)
+        ttk.Label(right, textvariable=self.status_var, wraplength=280, justify="left").grid(
+            row=13, column=0, sticky="w", padx=8, pady=(2, 8)
         )
-        self.profile_combo.grid(row=22, column=0, sticky="ew", padx=8, pady=(2, 4))
-        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_change)
-
-        sf_row = ttk.Frame(right)
-        sf_row.grid(row=23, column=0, sticky="ew", padx=8, pady=(2, 6))
-        sf_row.columnconfigure(1, weight=1)
-        ttk.Label(sf_row, text="Frames").grid(row=0, column=0, sticky="w")
-        ttk.Entry(sf_row, textvariable=self.session_frames_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 0))
-
-        ttk.Label(right, text="Session Output Dir").grid(row=24, column=0, sticky="w", padx=8)
-        ttk.Entry(right, textvariable=self.session_dir_var, width=34).grid(row=25, column=0, sticky="ew", padx=8, pady=(2, 4))
-        ttk.Label(right, text="Notes (optional)").grid(row=26, column=0, sticky="w", padx=8)
-        ttk.Entry(right, textvariable=self.session_notes_var, width=34).grid(row=27, column=0, sticky="ew", padx=8, pady=(2, 6))
-
-        cap_btn_row = ttk.Frame(right)
-        cap_btn_row.grid(row=28, column=0, sticky="ew", padx=8, pady=(0, 8))
-        ttk.Button(cap_btn_row, text="Capture Session", command=self._start_session_capture).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(cap_btn_row, text="Stop", command=self._stop_session_capture).grid(row=0, column=1)
 
     def _on_right_canvas_configure(self, event: tk.Event) -> None:
         try:
@@ -1573,7 +1534,7 @@ class BaumerLiveApp(tk.Tk):
             self.status_var.set("Command queue is full")
 
     def _snapshot_scientific(self) -> None:
-        self._start_session_capture(force_single=True)
+        self.status_var.set("RAW snapshot is disabled in recording mode")
 
     def _start_session_capture(self, force_single: bool = False) -> None:
         if not SCIENTIFIC_CAPTURE_AVAILABLE or SessionWriter is None or decode_buffer_to_ndarray is None:
@@ -1701,7 +1662,7 @@ class BaumerLiveApp(tk.Tk):
         if not camera_id:
             self.status_var.set("Camera ID is empty. Run Scan Cameras first.")
             return
-        self.event_q = queue.Queue(maxsize=64)
+        self.event_q = queue.Queue(maxsize=512)
         self.cmd_q = queue.Queue(maxsize=64)
         self.worker = CameraWorker(
             interface=interface,
@@ -1710,9 +1671,9 @@ class BaumerLiveApp(tk.Tk):
             cmd_q=self.cmd_q,
             packet_size=self.packet_size,
             packet_delay=self.packet_delay,
-            buffers=12,
+            buffers=48,
         )
-        self.status_var.set(f"Connecting... target processing={1.0/self.render_interval_s:.1f} fps")
+        self.status_var.set(f"Connecting... target recording={self.video_target_fps:.1f} fps")
         self.worker.start()
 
     def _disconnect(self) -> None:
@@ -2184,9 +2145,7 @@ class BaumerLiveApp(tk.Tk):
             self.status_var.set("Command queue is full")
 
     def _snapshot(self) -> None:
-        # Kept for backwards compatibility of method name in old bindings.
-        # Snapshot action now routes to scientific RAW session branch.
-        self._snapshot_scientific()
+        self.status_var.set("Snapshot is disabled. Use Start REC / Stop REC.")
 
     def _start_video_recording(self) -> None:
         if self.video_recording:
@@ -2198,54 +2157,173 @@ class BaumerLiveApp(tk.Tk):
         if np is None:
             self.status_var.set("Video recording unavailable: NumPy is not installed")
             return
+        if not (self.worker and self.worker.is_alive()):
+            self.status_var.set("Connect camera first")
+            return
         self.video_recording = True
+        self.video_stop_event.clear()
         self.video_writer = None
+        self.video_input_shape = None
+        self.video_is_color = False
+        self.video_encoder_name = "initializing"
+        while True:
+            try:
+                self.video_queue.get_nowait()
+            except queue.Empty:
+                break
         self.video_frames_written = 0
+        self.video_frames_enqueued = 0
+        self.video_frames_dropped = 0
+        self.video_write_fps = 0.0
+        self.video_target_fps = 100.0
+        self.preview_enabled = False
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.video_path = self.snapshot_dir / f"video_{ts}.mp4"
-        self.status_var.set("Video recording started")
+        self.video_writer_thread = threading.Thread(target=self._video_writer_worker, daemon=True)
+        self.video_writer_thread.start()
+        self.status_var.set("Video recording started (target=100 fps)")
 
     def _stop_video_recording(self, silent: bool = False) -> None:
-        writer = self.video_writer
-        self.video_writer = None
-        if writer is not None:
-            try:
-                writer.release()
-            except Exception:
-                pass
         was_recording = self.video_recording
         self.video_recording = False
+        self.video_stop_event.set()
+        th = self.video_writer_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=5.0)
+            if th.is_alive():
+                self._push_ui_event("status", "Video writer thread is still draining; stop may take longer")
+        self.video_writer_thread = None
         if not silent and was_recording:
             if self.video_path is not None:
-                self.status_var.set(f"Video saved: {self.video_path} ({self.video_frames_written} frames)")
+                self.status_var.set(
+                    f"Video saved: {self.video_path} ({self.video_frames_written} frames, dropped={self.video_frames_dropped}, enc={self.video_encoder_name})"
+                )
             else:
                 self.status_var.set(f"Video recording stopped ({self.video_frames_written} frames)")
 
-    def _write_video_frame(self, rgb: "np.ndarray | None", width: int, height: int) -> None:
-        if not self.video_recording or rgb is None or cv2 is None or np is None:
+    def _enqueue_video_frame(self, frame: FramePacket) -> None:
+        if not self.video_recording:
             return
-        if width <= 0 or height <= 0:
+        if frame.width <= 0 or frame.height <= 0:
             return
-        writer = self.video_writer
-        if writer is None:
-            path = self.video_path or (self.snapshot_dir / f"video_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4")
-            fps = max(1.0, min(120.0, 1.0 / max(1e-3, self.render_interval_s)))
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(path), fourcc, float(fps), (int(width), int(height)))
-            if not writer.isOpened():
-                self.video_recording = False
-                self.video_writer = None
-                self.status_var.set("Failed to start video writer")
-                return
-            self.video_path = path
-            self.video_writer = writer
         try:
-            bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
-            writer.write(bgr)
-            self.video_frames_written += 1
-        except Exception as exc:
-            self._stop_video_recording(silent=True)
-            self.status_var.set(f"Video write error: {exc}")
+            pf_name = str((frame.meta or {}).get("pixel_format_name") or self.camera_info.get("pixel_format") or "")
+            self.video_queue.put_nowait((frame.raw, int(frame.width), int(frame.height), pf_name.upper()))
+            self.video_frames_enqueued += 1
+        except queue.Full:
+            self.video_frames_dropped += 1
+
+    def _open_video_writer(self, width: int, height: int, is_color: bool) -> tuple[object | None, str]:
+        if cv2 is None:
+            return None, "opencv-unavailable"
+        path = self.video_path or (self.snapshot_dir / f"video_{dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4")
+        self.video_path = path
+        fps = float(max(1.0, min(240.0, self.video_target_fps)))
+        w = int(width)
+        h = int(height)
+        if w <= 0 or h <= 0:
+            return None, "invalid-size"
+
+        location = str(path).replace('"', '\\"')
+        gst_candidates: list[tuple[str, bool, str]] = []
+        if not is_color:
+            gst_candidates.append(
+                (
+                    "appsrc is-live=true block=false do-timestamp=true format=time ! "
+                    "queue leaky=downstream max-size-buffers=16 ! "
+                    f"video/x-raw,format=GRAY8,width={w},height={h},framerate={int(round(fps))}/1 ! "
+                    "videoconvert ! video/x-raw,format=I420 ! "
+                    "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+                    "nvv4l2h264enc maxperf-enable=1 preset-level=1 control-rate=1 bitrate=30000000 iframeinterval=100 idrinterval=100 insert-sps-pps=true ! "
+                    "h264parse ! qtmux ! "
+                    f'filesink location="{location}" sync=false',
+                    False,
+                    "jetson-nvv4l2-gray",
+                )
+            )
+        gst_candidates.append(
+            (
+                "appsrc is-live=true block=false do-timestamp=true format=time ! "
+                "queue leaky=downstream max-size-buffers=16 ! "
+                f"video/x-raw,format=BGR,width={w},height={h},framerate={int(round(fps))}/1 ! "
+                "videoconvert ! video/x-raw,format=I420 ! "
+                "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+                "nvv4l2h264enc maxperf-enable=1 preset-level=1 control-rate=1 bitrate=30000000 iframeinterval=100 idrinterval=100 insert-sps-pps=true ! "
+                "h264parse ! qtmux ! "
+                f'filesink location="{location}" sync=false',
+                True,
+                "jetson-nvv4l2-bgr",
+            )
+        )
+
+        for pipeline, color_flag, name in gst_candidates:
+            wr = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (w, h), color_flag)
+            if wr.isOpened():
+                return wr, name
+
+        # Fallback software codec path.
+        wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h), True)
+        if wr.isOpened():
+            return wr, "opencv-mp4v-bgr"
+        return None, "writer-open-failed"
+
+    def _video_writer_worker(self) -> None:
+        if cv2 is None or np is None:
+            return
+        writer = None
+        mode = "none"
+        window_start = time.monotonic()
+        window_written = 0
+        try:
+            while not self.video_stop_event.is_set() or not self.video_queue.empty():
+                try:
+                    raw, w, h, pf_upper = self.video_queue.get(timeout=0.08)
+                except queue.Empty:
+                    continue
+                if w <= 0 or h <= 0:
+                    continue
+                is_mono = len(raw) >= (w * h) and len(raw) < (w * h * 3)
+                if writer is None:
+                    writer, mode = self._open_video_writer(w, h, is_color=not is_mono)
+                    self.video_writer = writer
+                    self.video_encoder_name = mode
+                    self.video_input_shape = (w, h)
+                    self.video_is_color = not is_mono
+                    if writer is None:
+                        self.video_recording = False
+                        self.video_stop_event.set()
+                        self._push_ui_event("status", f"Video writer failed: {mode}")
+                        return
+                    self._push_ui_event("status", f"Recording started: encoder={mode}, {w}x{h}@{self.video_target_fps:.1f}fps")
+                try:
+                    if is_mono:
+                        gray = np.frombuffer(raw, dtype=np.uint8, count=(w * h)).reshape((h, w))
+                        if "gray" in mode:
+                            writer.write(gray)
+                        else:
+                            writer.write(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+                    else:
+                        arr = np.frombuffer(raw, dtype=np.uint8, count=(w * h * 3)).reshape((h, w, 3))
+                        if "RGB8" in pf_upper and "BGR8" not in pf_upper:
+                            arr = arr[:, :, ::-1]
+                        writer.write(np.ascontiguousarray(arr))
+                    self.video_frames_written += 1
+                    window_written += 1
+                    now = time.monotonic()
+                    dtw = now - window_start
+                    if dtw >= 1.0:
+                        self.video_write_fps = window_written / dtw
+                        window_start = now
+                        window_written = 0
+                except Exception:
+                    self.video_frames_dropped += 1
+        finally:
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+            self.video_writer = None
 
     def _set_calibration_panel_visible(self, visible: bool) -> None:
         if not hasattr(self, "calibration_panel"):
@@ -3349,10 +3427,8 @@ class BaumerLiveApp(tk.Tk):
                 elif kind == "frame":
                     if isinstance(payload, FramePacket):
                         self.last_frame = payload
-                        if self.dark_capture_active:
-                            self._consume_dark_capture_frame(payload)
-                        if self.flat_capture_active:
-                            self._consume_flat_capture_frame(payload)
+                        if self.video_recording:
+                            self._enqueue_video_frame(payload)
                         now = time.monotonic()
                         self._rx_frames += 1
                         rx_dt = now - self._rx_fps_window_ts
@@ -3360,12 +3436,18 @@ class BaumerLiveApp(tk.Tk):
                             self._rx_fps = self._rx_frames / rx_dt
                             self._rx_frames = 0
                             self._rx_fps_window_ts = now
-                        if self.active_session_writer is not None:
-                            self._save_frame_to_active_session(payload)
-                        now = time.monotonic()
-                        if now - self.last_render_ts >= self.render_interval_s:
-                            self._render_frame(payload)
-                            self.last_render_ts = now
+                        if self.preview_enabled and not self.video_recording:
+                            now = time.monotonic()
+                            if now - self.last_render_ts >= self.render_interval_s:
+                                self._render_frame(payload)
+                                self.last_render_ts = now
+                        elif (now - self._last_frame_label_ts) >= self.frame_label_interval_s:
+                            self._last_frame_label_ts = now
+                            self.frame_var.set(
+                                f"{payload.width}x{payload.height}, bytes={len(payload.raw)}\n"
+                                f"rx={self._rx_fps:.1f} fps, rec_write={self.video_write_fps:.1f} fps, target={self.video_target_fps:.1f}\n"
+                                f"enc={self.video_encoder_name}, q={self.video_queue.qsize()}/{self.video_queue.maxsize}, enq={self.video_frames_enqueued}, wr={self.video_frames_written}, drop={self.video_frames_dropped}"
+                            )
                 elif kind == "camera_config":
                     if isinstance(payload, dict):
                         self.last_camera_config = payload
@@ -3506,12 +3588,8 @@ class BaumerLiveApp(tk.Tk):
                 f"{frame.width}x{frame.height}, fmt=0x{frame.pixel_format:08x}, bytes={len(frame.raw)} (short)"
             )
             return
-        rot = self._get_rotation_deg()
-        zoom = max(0.25, min(4.0, float(self.zoom_var.get())))
         max_w = max(160, int(self.preview_max_w))
         max_h = max(120, int(self.preview_max_h))
-        need_record = bool(self.video_recording and np is not None)
-        record_rgb = None
         frame_meta = frame.meta or {}
         pixel_format_name = str(
             frame_meta.get("pixel_format_name")
@@ -3520,17 +3598,6 @@ class BaumerLiveApp(tk.Tk):
         )
         pf_upper = pixel_format_name.upper()
         is_rgb8 = ("RGB8" in pf_upper) or ("BGR8" in pf_upper)
-        is_raw_high_bit = ("BAYER" in pf_upper or "MONO" in pf_upper) and (
-            ("10" in pf_upper) or ("12" in pf_upper) or ("14" in pf_upper) or ("16" in pf_upper)
-        )
-
-        use_scientific_preview = bool(
-            FAST_PREVIEW_AVAILABLE
-            and SCIENTIFIC_CAPTURE_AVAILABLE
-            and decode_buffer_to_ndarray is not None
-            and make_preview_from_raw is not None
-            and is_raw_high_bit
-        )
 
         if FAST_PREVIEW_AVAILABLE and is_rgb8 and len(frame.raw) >= expected * 3:
             try:
@@ -3541,50 +3608,20 @@ class BaumerLiveApp(tk.Tk):
                 if ds > 1:
                     rgb = rgb[::ds, ::ds]
                 img = Image.fromarray(rgb, mode="RGB")
-                if rot:
-                    img = _rotate_pil_for_deg(img, rot)
-                if abs(zoom - 1.0) > 1e-6:
-                    zw = max(1, int(round(img.width * zoom)))
-                    zh = max(1, int(round(img.height * zoom)))
-                    img = img.resize((zw, zh), resample=Image.Resampling.NEAREST)
                 out_w = int(img.width)
                 out_h = int(img.height)
                 mode_label = "RGB"
-                if need_record:
-                    record_rgb = np.asarray(img, dtype=np.uint8)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:
                 self.status_var.set(f"RGB preview decode error: {exc}")
                 return
-        elif use_scientific_preview:
-            try:
-                raw_array = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format_name or frame.pixel_format)
-                rgb_preview = make_preview_from_raw(raw_array, pixel_format_name or frame.pixel_format, max_w, max_h)
-                img = Image.fromarray(rgb_preview, mode="RGB")
-                if rot:
-                    img = _rotate_pil_for_deg(img, rot)
-                if abs(zoom - 1.0) > 1e-6:
-                    zw = max(1, int(round(img.width * zoom)))
-                    zh = max(1, int(round(img.height * zoom)))
-                    img = img.resize((zw, zh), resample=Image.Resampling.NEAREST)
-                out_w = int(img.width)
-                out_h = int(img.height)
-                mode_label = "RGB" if "BAYER" in pf_upper else "Mono"
-                if need_record:
-                    record_rgb = np.asarray(img, dtype=np.uint8)
-                photo = ImageTk.PhotoImage(img)
-            except Exception as exc:
-                self.status_var.set(f"Scientific preview decode error: {exc}")
-                return
         elif FAST_PREVIEW_AVAILABLE:
             try:
                 img, out_w, out_h, mode_label = build_preview_image_fast(
-                    frame.raw[:expected], frame.width, frame.height, frame.pixel_format, rot, zoom, max_w, max_h
+                    frame.raw[:expected], frame.width, frame.height, frame.pixel_format, 0, 1.0, max_w, max_h
                 )
                 if img is None:
                     return
-                if need_record:
-                    record_rgb = np.asarray(img, dtype=np.uint8)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:
                 self.status_var.set(f"Preview fast-path error: {exc}")
@@ -3601,10 +3638,6 @@ class BaumerLiveApp(tk.Tk):
                     return
                 rgb = mono_to_rgb_bytes(mono)
                 mode_label = "Mono"
-            if rot:
-                out_w, out_h, rgb = rotate_rgb(rgb, out_w, out_h, rot)
-            if abs(zoom - 1.0) > 1e-6:
-                out_w, out_h, rgb = resize_rgb_nearest(rgb, out_w, out_h, zoom)
             png = rgb_to_png_bytes(rgb, out_w, out_h, level=1)
             if not png:
                 self.status_var.set("Preview render error: empty PNG")
@@ -3615,8 +3648,6 @@ class BaumerLiveApp(tk.Tk):
             except tk.TclError as exc:
                 self.status_var.set(f"Preview render error: {exc}")
                 return
-            if need_record:
-                record_rgb = np.frombuffer(rgb, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
 
         self.preview_photo = photo
         self.preview_canvas.itemconfigure(self.canvas_image_id, image=photo, state="normal")
@@ -3643,10 +3674,9 @@ class BaumerLiveApp(tk.Tk):
             self._last_frame_label_ts = now
             self.frame_var.set(
                 f"{frame.width}x{frame.height} -> preview {out_w}x{out_h} ({mode_label})\n"
-                f"pixel_format=0x{frame.pixel_format:08x}, bytes={len(frame.raw)}, rot={rot}, zoom={zoom:.2f}x\n"
-                f"rx={self._rx_fps:.1f} fps, processing={self._render_fps:.1f} fps, target={1.0/self.render_interval_s:.1f} fps"
+                f"pixel_format=0x{frame.pixel_format:08x}, bytes={len(frame.raw)}\n"
+                f"rx={self._rx_fps:.1f} fps, preview={self._render_fps:.1f} fps"
             )
-        self._write_video_frame(record_rgb, out_w, out_h)
 
     def _on_close(self) -> None:
         if self.active_session_writer is not None:
