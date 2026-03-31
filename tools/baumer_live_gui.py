@@ -965,8 +965,8 @@ class CameraWorker(threading.Thread):
         if wh is None or payload_before <= 0:
             return
         w0, h0 = wh
-        # Practical USB3 budget on Jetson for stable continuous transfer.
-        target_payload = int(140_000_000 / max(1.0, float(target_fps)))
+        # Conservative USB3 budget on Jetson for stable continuous transfer.
+        target_payload = int(70_000_000 / max(1.0, float(target_fps)))
         if payload_before > target_payload:
             scale = math.sqrt(float(target_payload) / float(payload_before))
             sw = self._align_down(int(w0 * scale), 16)
@@ -1001,6 +1001,56 @@ class CameraWorker(threading.Thread):
                 "status",
                 f"USB speed mode: {wh_after[0]}x{wh_after[1]}, payload={payload_after} B, target={target_fps:.1f} fps",
             )
+
+    def _force_usb_emergency_mode(self, camera, target_fps: float) -> tuple[int, int, int] | None:
+        self._try_disable_chunk_mode(camera)
+        self._try_force_mono8(camera)
+        # Hard fallback profile for transport recovery.
+        candidates = [(640, 480), (800, 600), (960, 720), (320, 240)]
+        chosen: tuple[int, int] | None = None
+        for w, h in candidates:
+            if self._set_width_height(camera, w, h):
+                chosen = (w, h)
+                break
+        if chosen is None:
+            wh = self._get_width_height(camera)
+            if wh is None:
+                return None
+            chosen = (int(wh[0]), int(wh[1]))
+        self._set_target_frame_rate(camera, target_fps)
+        self._try_set_safe_exposure_for_fps(camera, target_fps)
+        try:
+            payload = int(camera.get_payload())
+        except Exception:
+            payload = 0
+        return int(chosen[0]), int(chosen[1]), int(payload)
+
+    @staticmethod
+    def _build_usb_roi_fallback_plan(width: int, height: int) -> list[tuple[int, int]]:
+        base = (max(16, int(width)), max(16, int(height)))
+        candidates = [
+            base,
+            (1280, 960),
+            (1280, 720),
+            (1024, 768),
+            (960, 720),
+            (800, 600),
+            (640, 480),
+        ]
+        out: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        max_w, max_h = base
+        for w, h in candidates:
+            if w <= 0 or h <= 0:
+                continue
+            if w > max_w or h > max_h:
+                continue
+            item = (int(w), int(h))
+            if item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        return out
 
     def _set_target_frame_rate(self, camera, fps: float) -> None:
         target = float(max(1.0, min(240.0, fps)))
@@ -1323,6 +1373,15 @@ class CameraWorker(threading.Thread):
             bad_status_streak = 0
             fps_fallback_plan = (100.0, 80.0, 60.0, 40.0, 30.0)
             fps_step_idx = 0
+            good_frame_count = 0
+            stream_start_ts = time.monotonic()
+            emergency_mode_applied = False
+            usb_roi_plan: list[tuple[int, int]] = []
+            usb_roi_idx = 0
+            if not is_gige:
+                cur_wh = self._get_width_height(camera)
+                if cur_wh is not None:
+                    usb_roi_plan = self._build_usb_roi_fallback_plan(cur_wh[0], cur_wh[1])
             while not self.stop_event.is_set():
                 while True:
                     try:
@@ -1348,6 +1407,7 @@ class CameraWorker(threading.Thread):
                         pf = int(buffer.get_image_pixel_format())
                         meta = {"pixel_format_name": pixel_format_name} if pixel_format_name else None
                         self._last_good_frame_ts = time.monotonic()
+                        good_frame_count += 1
                         self._emit("frame", FramePacket(w, h, pf, raw, time.time(), meta))
                     except Exception as exc:
                         self._emit("status", f"Frame decode error: {exc}")
@@ -1359,7 +1419,37 @@ class CameraWorker(threading.Thread):
                         self._last_bad_status_log_ts = now_bad
                         self._emit("status", f"Bad frame status: {status} ({status_name})")
                     if status_name in ("SIZE_MISMATCH", "MISSING_PACKETS", "WRONG_PACKET_ID") and bad_status_streak >= 12:
-                        if fps_step_idx + 1 < len(fps_fallback_plan):
+                        recovered = False
+                        if (not is_gige) and (usb_roi_idx + 1 < len(usb_roi_plan)):
+                            next_idx = usb_roi_idx + 1
+                            next_w, next_h = usb_roi_plan[next_idx]
+                            try:
+                                camera.stop_acquisition()
+                            except Exception:
+                                pass
+                            time.sleep(0.02)
+                            try:
+                                if self._set_width_height(camera, next_w, next_h):
+                                    try:
+                                        now_payload = int(camera.get_payload())
+                                    except Exception:
+                                        now_payload = 0
+                                    self._set_target_frame_rate(camera, target_fps)
+                                    self._try_set_safe_exposure_for_fps(camera, target_fps)
+                                    camera.start_acquisition()
+                                    self._last_good_frame_ts = time.monotonic()
+                                    usb_roi_idx = next_idx
+                                    recovered = True
+                                    self._emit(
+                                        "status",
+                                        f"USB packet loss: switched ROI to {next_w}x{next_h}, payload={now_payload} B, keep {target_fps:.1f} fps",
+                                    )
+                                else:
+                                    camera.start_acquisition()
+                            except Exception:
+                                pass
+                            bad_status_streak = 0
+                        if (not recovered) and (fps_step_idx + 1 < len(fps_fallback_plan)):
                             fps_step_idx += 1
                             fallback_fps = float(fps_fallback_plan[fps_step_idx])
                             try:
@@ -1378,6 +1468,35 @@ class CameraWorker(threading.Thread):
                             try:
                                 camera.start_acquisition()
                                 self._last_good_frame_ts = time.monotonic()
+                            except Exception:
+                                pass
+                            bad_status_streak = 0
+                        if (
+                            (not is_gige)
+                            and (not emergency_mode_applied)
+                            and good_frame_count == 0
+                            and (time.monotonic() - stream_start_ts) > 1.2
+                        ):
+                            try:
+                                camera.stop_acquisition()
+                            except Exception:
+                                pass
+                            time.sleep(0.03)
+                            try:
+                                out = self._force_usb_emergency_mode(camera, target_fps)
+                                camera.start_acquisition()
+                                self._last_good_frame_ts = time.monotonic()
+                                if out is not None:
+                                    ew, eh, ep = out
+                                    self._emit(
+                                        "status",
+                                        f"Emergency USB mode enabled: {ew}x{eh}, payload={ep} B, target={target_fps:.1f} fps",
+                                    )
+                                    usb_roi_plan = self._build_usb_roi_fallback_plan(ew, eh)
+                                    usb_roi_idx = 0
+                                else:
+                                    self._emit("status", "Emergency USB mode attempted (resolution unknown)")
+                                emergency_mode_applied = True
                             except Exception:
                                 pass
                             bad_status_streak = 0
@@ -1889,7 +2008,7 @@ class BaumerLiveApp(tk.Tk):
             cmd_q=self.cmd_q,
             packet_size=self.packet_size,
             packet_delay=self.packet_delay,
-            buffers=48,
+            buffers=96,
         )
         self.status_var.set(f"Connecting... target recording={self.video_target_fps:.1f} fps")
         self.worker.start()
