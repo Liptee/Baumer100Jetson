@@ -860,6 +860,148 @@ class CameraWorker(threading.Thread):
         except Exception:
             pass
 
+    @staticmethod
+    def _align_down(value: int, step: int) -> int:
+        s = max(1, int(step))
+        v = int(value)
+        return max(s, (v // s) * s)
+
+    @staticmethod
+    def _get_width_height(camera) -> tuple[int, int] | None:
+        fn_region = getattr(camera, "get_region", None)
+        if callable(fn_region):
+            try:
+                reg = fn_region()
+                if isinstance(reg, tuple) and len(reg) >= 4:
+                    return int(reg[2]), int(reg[3])
+            except Exception:
+                pass
+        fn_get_int = getattr(camera, "get_integer", None)
+        if callable(fn_get_int):
+            try:
+                w = int(fn_get_int("Width"))
+                h = int(fn_get_int("Height"))
+                if w > 0 and h > 0:
+                    return w, h
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _set_width_height(camera, width: int, height: int) -> bool:
+        w = max(16, int(width))
+        h = max(16, int(height))
+        fn_region = getattr(camera, "set_region", None)
+        if callable(fn_region):
+            try:
+                fn_region(0, 0, w, h)
+                return True
+            except Exception:
+                pass
+        fn_set_int = getattr(camera, "set_integer", None)
+        if callable(fn_set_int):
+            try:
+                fn_set_int("Width", w)
+                fn_set_int("Height", h)
+                return True
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _try_disable_chunk_mode(camera) -> None:
+        for setter in ("set_string", "set_boolean", "set_integer"):
+            fn = getattr(camera, setter, None)
+            if not callable(fn):
+                continue
+            try:
+                if setter == "set_string":
+                    fn("ChunkModeActive", "Off")
+                    fn("ChunkEnable", "Off")
+                elif setter == "set_boolean":
+                    fn("ChunkModeActive", False)
+                    fn("ChunkEnable", False)
+                else:
+                    fn("ChunkModeActive", 0)
+                    fn("ChunkEnable", 0)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _try_force_mono8(camera) -> None:
+        for setter in ("set_pixel_format_from_string", "set_string"):
+            fn = getattr(camera, setter, None)
+            if not callable(fn):
+                continue
+            try:
+                if setter == "set_pixel_format_from_string":
+                    fn("Mono8")
+                else:
+                    fn("PixelFormat", "Mono8")
+                return
+            except Exception:
+                continue
+
+    def _try_set_safe_exposure_for_fps(self, camera, fps: float) -> None:
+        try:
+            current = float(camera.get_exposure_time())
+        except Exception:
+            return
+        # Keep exposure below frame period margin to avoid timing instability at high FPS.
+        safe_us = max(100.0, min(current, 0.80 * (1_000_000.0 / max(1.0, float(fps)))))
+        try:
+            camera.set_exposure_time(float(safe_us))
+        except Exception:
+            pass
+
+    def _optimize_usb_100fps_mode(self, camera, target_fps: float) -> None:
+        self._try_disable_chunk_mode(camera)
+        self._try_force_mono8(camera)
+        try:
+            payload_before = int(camera.get_payload())
+        except Exception:
+            payload_before = 0
+        wh = self._get_width_height(camera)
+        if wh is None or payload_before <= 0:
+            return
+        w0, h0 = wh
+        # Practical USB3 budget on Jetson for stable continuous transfer.
+        target_payload = int(140_000_000 / max(1.0, float(target_fps)))
+        if payload_before > target_payload:
+            scale = math.sqrt(float(target_payload) / float(payload_before))
+            sw = self._align_down(int(w0 * scale), 16)
+            sh = self._align_down(int(h0 * scale), 16)
+            candidates = [
+                (sw, sh),
+                (1280, 960),
+                (1280, 720),
+                (1024, 768),
+                (960, 720),
+                (800, 600),
+                (640, 480),
+            ]
+            for cw, ch in candidates:
+                if cw <= 0 or ch <= 0 or cw > w0 or ch > h0:
+                    continue
+                if not self._set_width_height(camera, cw, ch):
+                    continue
+                try:
+                    now_payload = int(camera.get_payload())
+                except Exception:
+                    now_payload = 0
+                if 0 < now_payload <= target_payload:
+                    break
+        try:
+            payload_after = int(camera.get_payload())
+        except Exception:
+            payload_after = payload_before
+        wh_after = self._get_width_height(camera)
+        if wh_after is not None:
+            self._emit(
+                "status",
+                f"USB speed mode: {wh_after[0]}x{wh_after[1]}, payload={payload_after} B, target={target_fps:.1f} fps",
+            )
+
     def _set_target_frame_rate(self, camera, fps: float) -> None:
         target = float(max(1.0, min(240.0, fps)))
         enabled = False
@@ -1109,8 +1251,18 @@ class CameraWorker(threading.Thread):
             except Exception:
                 pass
             self._set_auto_controls_off(camera)
+            target_fps = 100.0
+            if not is_gige:
+                try:
+                    self._optimize_usb_100fps_mode(camera, target_fps)
+                except Exception:
+                    pass
             try:
-                self._set_target_frame_rate(camera, 100.0)
+                self._set_target_frame_rate(camera, target_fps)
+            except Exception:
+                pass
+            try:
+                self._try_set_safe_exposure_for_fps(camera, target_fps)
             except Exception:
                 pass
             if is_gige and self.packet_size > 0:
