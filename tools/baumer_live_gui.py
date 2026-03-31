@@ -37,6 +37,8 @@ DEFAULT_PACKET_SIZE = 1440
 DEFAULT_PACKET_DELAY = 1000
 DEFAULT_PREVIEW_FPS = 100.0
 DEFAULT_UI_POLL_MS = 10
+DEFAULT_PREVIEW_MAX_W = 640
+DEFAULT_PREVIEW_MAX_H = 480
 
 try:
     from baumer_force_ip import send_force_ip as gvcp_force_ip
@@ -786,7 +788,8 @@ class CameraWorker(threading.Thread):
 
     def _emit(self, kind: str, payload: object | None = None) -> None:
         if kind == "frame":
-            if self.event_q.qsize() > 3:
+            # Keep frame latency low on low-power devices by dropping stale frames aggressively.
+            if self.event_q.qsize() > 1:
                 return
         try:
             self.event_q.put_nowait((kind, payload))
@@ -1226,6 +1229,10 @@ class BaumerLiveApp(tk.Tk):
         self._render_fps = 0.0
         self._render_frames = 0
         self._render_fps_window_ts = time.monotonic()
+        self._last_frame_label_ts = 0.0
+        self.frame_label_interval_s = 0.25
+        self.preview_max_w = int(DEFAULT_PREVIEW_MAX_W)
+        self.preview_max_h = int(DEFAULT_PREVIEW_MAX_H)
         self.camera_info: dict[str, object] = {}
         self.last_camera_config: dict[str, object] | None = None
         self.active_session_writer: SessionWriter | None = None
@@ -3501,6 +3508,9 @@ class BaumerLiveApp(tk.Tk):
             return
         rot = self._get_rotation_deg()
         zoom = max(0.25, min(4.0, float(self.zoom_var.get())))
+        max_w = max(160, int(self.preview_max_w))
+        max_h = max(120, int(self.preview_max_h))
+        need_record = bool(self.video_recording and np is not None)
         record_rgb = None
         frame_meta = frame.meta or {}
         pixel_format_name = str(
@@ -3527,6 +3537,9 @@ class BaumerLiveApp(tk.Tk):
                 rgb = np.frombuffer(frame.raw[: expected * 3], dtype=np.uint8).reshape((frame.height, frame.width, 3))
                 if "BGR8" in pf_upper:
                     rgb = rgb[:, :, ::-1]
+                ds = max(1, int(math.ceil(max(rgb.shape[1] / max_w, rgb.shape[0] / max_h))))
+                if ds > 1:
+                    rgb = rgb[::ds, ::ds]
                 img = Image.fromarray(rgb, mode="RGB")
                 if rot:
                     img = _rotate_pil_for_deg(img, rot)
@@ -3537,7 +3550,7 @@ class BaumerLiveApp(tk.Tk):
                 out_w = int(img.width)
                 out_h = int(img.height)
                 mode_label = "RGB"
-                if np is not None:
+                if need_record:
                     record_rgb = np.asarray(img, dtype=np.uint8)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:
@@ -3546,7 +3559,7 @@ class BaumerLiveApp(tk.Tk):
         elif use_scientific_preview:
             try:
                 raw_array = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format_name or frame.pixel_format)
-                rgb_preview = make_preview_from_raw(raw_array, pixel_format_name or frame.pixel_format, 960, 640)
+                rgb_preview = make_preview_from_raw(raw_array, pixel_format_name or frame.pixel_format, max_w, max_h)
                 img = Image.fromarray(rgb_preview, mode="RGB")
                 if rot:
                     img = _rotate_pil_for_deg(img, rot)
@@ -3557,7 +3570,7 @@ class BaumerLiveApp(tk.Tk):
                 out_w = int(img.width)
                 out_h = int(img.height)
                 mode_label = "RGB" if "BAYER" in pf_upper else "Mono"
-                if np is not None:
+                if need_record:
                     record_rgb = np.asarray(img, dtype=np.uint8)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:
@@ -3566,11 +3579,11 @@ class BaumerLiveApp(tk.Tk):
         elif FAST_PREVIEW_AVAILABLE:
             try:
                 img, out_w, out_h, mode_label = build_preview_image_fast(
-                    frame.raw[:expected], frame.width, frame.height, frame.pixel_format, rot, zoom, 960, 640
+                    frame.raw[:expected], frame.width, frame.height, frame.pixel_format, rot, zoom, max_w, max_h
                 )
                 if img is None:
                     return
-                if np is not None:
+                if need_record:
                     record_rgb = np.asarray(img, dtype=np.uint8)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:
@@ -3578,12 +3591,12 @@ class BaumerLiveApp(tk.Tk):
                 return
         else:
             if is_bayer_rg8(frame.pixel_format):
-                out_w, out_h, rgb = preview_bayer_rg8_fast(frame.raw[:expected], frame.width, frame.height, 960, 640)
+                out_w, out_h, rgb = preview_bayer_rg8_fast(frame.raw[:expected], frame.width, frame.height, max_w, max_h)
                 if out_w <= 0 or out_h <= 0:
                     return
                 mode_label = "RGB"
             else:
-                out_w, out_h, mono = downsample_mono(frame.raw[:expected], frame.width, frame.height, 960, 640)
+                out_w, out_h, mono = downsample_mono(frame.raw[:expected], frame.width, frame.height, max_w, max_h)
                 if out_w <= 0 or out_h <= 0:
                     return
                 rgb = mono_to_rgb_bytes(mono)
@@ -3602,7 +3615,7 @@ class BaumerLiveApp(tk.Tk):
             except tk.TclError as exc:
                 self.status_var.set(f"Preview render error: {exc}")
                 return
-            if np is not None:
+            if need_record:
                 record_rgb = np.frombuffer(rgb, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
 
         self.preview_photo = photo
@@ -3626,11 +3639,13 @@ class BaumerLiveApp(tk.Tk):
             self._render_fps = self._render_frames / render_dt
             self._render_frames = 0
             self._render_fps_window_ts = now
-        self.frame_var.set(
-            f"{frame.width}x{frame.height} -> preview {out_w}x{out_h} ({mode_label})\n"
-            f"pixel_format=0x{frame.pixel_format:08x}, bytes={len(frame.raw)}, rot={rot}, zoom={zoom:.2f}x\n"
-            f"rx={self._rx_fps:.1f} fps, processing={self._render_fps:.1f} fps, target={1.0/self.render_interval_s:.1f} fps"
-        )
+        if (now - self._last_frame_label_ts) >= self.frame_label_interval_s:
+            self._last_frame_label_ts = now
+            self.frame_var.set(
+                f"{frame.width}x{frame.height} -> preview {out_w}x{out_h} ({mode_label})\n"
+                f"pixel_format=0x{frame.pixel_format:08x}, bytes={len(frame.raw)}, rot={rot}, zoom={zoom:.2f}x\n"
+                f"rx={self._rx_fps:.1f} fps, processing={self._render_fps:.1f} fps, target={1.0/self.render_interval_s:.1f} fps"
+            )
         self._write_video_frame(record_rgb, out_w, out_h)
 
     def _on_close(self) -> None:
