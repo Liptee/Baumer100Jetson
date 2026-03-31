@@ -49,16 +49,28 @@ except Exception:
     gvcp_discover = None  # type: ignore[assignment]
     AUTO_FIX_AVAILABLE = False
 
+NUMPY_IMPORT_ERROR: str | None = None
+PIL_IMPORT_ERROR: str | None = None
 try:
     import numpy as np
+
+    NUMPY_AVAILABLE = True
+except Exception as exc:
+    np = None  # type: ignore[assignment]
+    NUMPY_AVAILABLE = False
+    NUMPY_IMPORT_ERROR = str(exc)
+
+try:
     from PIL import Image, ImageTk
 
-    FAST_PREVIEW_AVAILABLE = True
-except Exception:
-    np = None  # type: ignore[assignment]
+    PIL_AVAILABLE = True
+except Exception as exc:
     Image = None  # type: ignore[assignment]
     ImageTk = None  # type: ignore[assignment]
-    FAST_PREVIEW_AVAILABLE = False
+    PIL_AVAILABLE = False
+    PIL_IMPORT_ERROR = str(exc)
+
+FAST_PREVIEW_AVAILABLE = bool(NUMPY_AVAILABLE and PIL_AVAILABLE)
 
 try:
     import cv2
@@ -2155,7 +2167,10 @@ class BaumerLiveApp(tk.Tk):
             self.status_var.set("Video recording unavailable: OpenCV is not installed")
             return
         if np is None:
-            self.status_var.set("Video recording unavailable: NumPy is not installed")
+            if NUMPY_IMPORT_ERROR:
+                self.status_var.set(f"Video recording unavailable: NumPy import failed ({NUMPY_IMPORT_ERROR})")
+            else:
+                self.status_var.set("Video recording unavailable: NumPy is not installed")
             return
         if not (self.worker and self.worker.is_alive()):
             self.status_var.set("Connect camera first")
