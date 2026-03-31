@@ -1707,6 +1707,54 @@ class BaumerLiveApp(tk.Tk):
             out.append((dev_id, transport))
         return out
 
+    @staticmethod
+    def _scan_cameras_aravis_api() -> list[tuple[str, str]]:
+        try:
+            import gi
+
+            gi.require_version("Aravis", "0.8")
+            from gi.repository import Aravis  # type: ignore
+        except Exception:
+            return []
+
+        try:
+            Aravis.update_device_list()
+        except Exception:
+            pass
+
+        try:
+            n = int(Aravis.get_n_devices())
+        except Exception:
+            return []
+
+        out: list[tuple[str, str]] = []
+        for i in range(max(0, n)):
+            try:
+                dev_id = str(Aravis.get_device_id(i)).strip()
+            except Exception:
+                continue
+            if not dev_id:
+                continue
+            transport = "unknown"
+            for getter in ("get_device_protocol", "get_device_transport_layer"):
+                fn = getattr(Aravis, getter, None)
+                if callable(fn):
+                    try:
+                        v = fn(i)
+                        if v is not None and str(v).strip():
+                            transport = str(v).strip()
+                            break
+                    except Exception:
+                        pass
+            if transport == "unknown":
+                lo = dev_id.lower()
+                if "usb" in lo:
+                    transport = "USB3Vision"
+                elif "gev" in lo or "gige" in lo:
+                    transport = "GigEVision"
+            out.append((dev_id, transport))
+        return out
+
     def _scan_cameras(self, auto_connect: bool = False) -> None:
         if self.camera_scan_running:
             self.status_var.set("Camera scan already running")
@@ -1725,15 +1773,11 @@ class BaumerLiveApp(tk.Tk):
 
         try:
             arv_tool = shutil.which("arv-tool-0.8") or shutil.which("arv-tool")
-            if not arv_tool:
-                emit("camera_scan_done", {"ok": False, "error": "arv-tool not found"})
-                return
-            cmds: list[list[str]] = [[arv_tool]]
             merged: list[tuple[str, str]] = []
             seen: set[str] = set()
-            for cmd in cmds:
+            if arv_tool:
                 try:
-                    out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=6.0)
+                    out = subprocess.check_output([arv_tool], text=True, stderr=subprocess.STDOUT, timeout=6.0)
                 except Exception as exc:
                     out = str(exc)
                 for dev_id, transport in self._parse_arv_list_output(out):
@@ -1742,7 +1786,22 @@ class BaumerLiveApp(tk.Tk):
                     seen.add(dev_id)
                     merged.append((dev_id, transport))
             if not merged:
-                emit("camera_scan_done", {"ok": False, "error": "No cameras detected"})
+                for dev_id, transport in self._scan_cameras_aravis_api():
+                    if dev_id in seen:
+                        continue
+                    seen.add(dev_id)
+                    merged.append((dev_id, transport))
+            if not merged:
+                if arv_tool:
+                    emit("camera_scan_done", {"ok": False, "error": "No cameras detected"})
+                else:
+                    emit(
+                        "camera_scan_done",
+                        {
+                            "ok": False,
+                            "error": "arv-tool not found and Aravis API scan failed",
+                        },
+                    )
                 return
             usb = [item for item in merged if "usb" in item[1].lower()]
             picked = usb[0] if usb else merged[0]
