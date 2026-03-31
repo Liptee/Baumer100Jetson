@@ -28,6 +28,7 @@ import time
 import tkinter as tk
 import zlib
 from dataclasses import dataclass
+from glob import glob
 from pathlib import Path
 from tkinter import ttk
 
@@ -1708,14 +1709,39 @@ class BaumerLiveApp(tk.Tk):
         return out
 
     @staticmethod
-    def _scan_cameras_aravis_api() -> list[tuple[str, str]]:
+    def _find_arv_tool_binary() -> str | None:
+        for name in ("arv-tool-0.8", "arv-tool-0.6", "arv-tool-0.4", "arv-tool"):
+            p = shutil.which(name)
+            if p:
+                return p
+        for p in sorted(glob("/usr/bin/arv-tool-*") + glob("/usr/local/bin/arv-tool-*")):
+            if Path(p).is_file():
+                return p
+        return None
+
+    @staticmethod
+    def _scan_cameras_aravis_api() -> tuple[list[tuple[str, str]], str | None]:
         try:
             import gi
+        except Exception as exc:
+            return [], f"python gi import failed: {exc}"
 
-            gi.require_version("Aravis", "0.8")
+        selected_version = ""
+        last_err: Exception | None = None
+        for ver in ("0.8", "0.6", "0.4"):
+            try:
+                gi.require_version("Aravis", ver)
+                selected_version = ver
+                break
+            except Exception as exc:
+                last_err = exc
+        if not selected_version:
+            return [], f"Aravis typelib not found (tried 0.8/0.6/0.4): {last_err}"
+
+        try:
             from gi.repository import Aravis  # type: ignore
-        except Exception:
-            return []
+        except Exception as exc:
+            return [], f"Aravis import failed: {exc}"
 
         try:
             Aravis.update_device_list()
@@ -1724,8 +1750,8 @@ class BaumerLiveApp(tk.Tk):
 
         try:
             n = int(Aravis.get_n_devices())
-        except Exception:
-            return []
+        except Exception as exc:
+            return [], f"Aravis get_n_devices failed: {exc}"
 
         out: list[tuple[str, str]] = []
         for i in range(max(0, n)):
@@ -1753,7 +1779,9 @@ class BaumerLiveApp(tk.Tk):
                 elif "gev" in lo or "gige" in lo:
                     transport = "GigEVision"
             out.append((dev_id, transport))
-        return out
+        if out:
+            return out, None
+        return [], f"Aravis {selected_version} loaded, but get_n_devices() returned 0"
 
     def _scan_cameras(self, auto_connect: bool = False) -> None:
         if self.camera_scan_running:
@@ -1772,7 +1800,7 @@ class BaumerLiveApp(tk.Tk):
                 pass
 
         try:
-            arv_tool = shutil.which("arv-tool-0.8") or shutil.which("arv-tool")
+            arv_tool = self._find_arv_tool_binary()
             merged: list[tuple[str, str]] = []
             seen: set[str] = set()
             if arv_tool:
@@ -1785,21 +1813,26 @@ class BaumerLiveApp(tk.Tk):
                         continue
                     seen.add(dev_id)
                     merged.append((dev_id, transport))
+            api_error: str | None = None
             if not merged:
-                for dev_id, transport in self._scan_cameras_aravis_api():
+                api_devices, api_error = self._scan_cameras_aravis_api()
+                for dev_id, transport in api_devices:
                     if dev_id in seen:
                         continue
                     seen.add(dev_id)
                     merged.append((dev_id, transport))
             if not merged:
                 if arv_tool:
-                    emit("camera_scan_done", {"ok": False, "error": "No cameras detected"})
+                    if api_error:
+                        emit("camera_scan_done", {"ok": False, "error": f"No cameras detected. API fallback: {api_error}"})
+                    else:
+                        emit("camera_scan_done", {"ok": False, "error": "No cameras detected"})
                 else:
                     emit(
                         "camera_scan_done",
                         {
                             "ok": False,
-                            "error": "arv-tool not found and Aravis API scan failed",
+                            "error": f"arv-tool not found. {api_error or 'Aravis API scan failed'}",
                         },
                     )
                 return
