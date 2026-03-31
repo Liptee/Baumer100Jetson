@@ -1013,6 +1013,30 @@ class CameraWorker(threading.Thread):
                 continue
         raise RuntimeError("buffer payload API unavailable (tried get_image_data/get_data)")
 
+    @staticmethod
+    def _buffer_status_name(aravis_mod, status_code: int) -> str:
+        names = (
+            "SUCCESS",
+            "CLEARED",
+            "TIMEOUT",
+            "MISSING_PACKETS",
+            "WRONG_PACKET_ID",
+            "SIZE_MISMATCH",
+            "FILLING",
+            "ABORTED",
+        )
+        if 0 <= int(status_code) < len(names):
+            return names[int(status_code)]
+        # Fallback for unknown/extended statuses.
+        for attr in dir(getattr(aravis_mod, "BufferStatus", object)):
+            if attr.isupper():
+                try:
+                    if int(getattr(aravis_mod.BufferStatus, attr)) == int(status_code):
+                        return attr
+                except Exception:
+                    continue
+        return "UNKNOWN"
+
     def run(self) -> None:
         camera = None
         stream = None
@@ -1100,12 +1124,13 @@ class CameraWorker(threading.Thread):
                 except Exception:
                     pass
 
-            payload = int(camera.get_payload())
-            if payload <= 0:
+            payload_raw = int(camera.get_payload())
+            if payload_raw <= 0:
                 raise RuntimeError("Invalid payload size")
+            payload_alloc = int(payload_raw + max(65536, payload_raw // 8))
 
             for _ in range(max(2, self.buffers)):
-                stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+                stream.push_buffer(Aravis.Buffer.new_allocate(payload_alloc))
 
             controls = self._read_controls(camera)
             runtime_meta = read_camera_runtime_metadata(camera) if read_camera_runtime_metadata is not None else {}
@@ -1127,7 +1152,7 @@ class CameraWorker(threading.Thread):
                     "model": str(camera.get_model_name()),
                     "serial": serial,
                     "pixel_format": pixel_format_name,
-                    "payload": payload,
+                    "payload": payload_raw,
                     "controls": controls,
                     "runtime": runtime_meta,
                 },
@@ -1143,6 +1168,9 @@ class CameraWorker(threading.Thread):
             self._last_restart_ts = now_mono
 
             success_status = int(Aravis.BufferStatus.SUCCESS)
+            bad_status_streak = 0
+            fps_fallback_plan = (100.0, 80.0, 60.0, 40.0, 30.0)
+            fps_step_idx = 0
             while not self.stop_event.is_set():
                 while True:
                     try:
@@ -1160,6 +1188,7 @@ class CameraWorker(threading.Thread):
                     continue
                 status = int(buffer.get_status())
                 if status == success_status:
+                    bad_status_streak = 0
                     try:
                         raw = self._buffer_image_bytes(buffer)
                         w = int(buffer.get_image_width())
@@ -1171,10 +1200,35 @@ class CameraWorker(threading.Thread):
                     except Exception as exc:
                         self._emit("status", f"Frame decode error: {exc}")
                 else:
+                    bad_status_streak += 1
                     now_bad = time.monotonic()
+                    status_name = self._buffer_status_name(Aravis, status)
                     if (now_bad - self._last_bad_status_log_ts) > 1.5:
                         self._last_bad_status_log_ts = now_bad
-                        self._emit("status", f"Bad frame status: {status}")
+                        self._emit("status", f"Bad frame status: {status} ({status_name})")
+                    if status_name in ("SIZE_MISMATCH", "MISSING_PACKETS", "WRONG_PACKET_ID") and bad_status_streak >= 12:
+                        if fps_step_idx + 1 < len(fps_fallback_plan):
+                            fps_step_idx += 1
+                            fallback_fps = float(fps_fallback_plan[fps_step_idx])
+                            try:
+                                self._set_target_frame_rate(camera, fallback_fps)
+                                self._emit(
+                                    "status",
+                                    f"Stream unstable at high FPS, fallback to {fallback_fps:.1f} fps and restart acquisition",
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                camera.stop_acquisition()
+                            except Exception:
+                                pass
+                            time.sleep(0.03)
+                            try:
+                                camera.start_acquisition()
+                                self._last_good_frame_ts = time.monotonic()
+                            except Exception:
+                                pass
+                            bad_status_streak = 0
                     self._maybe_restart_acquisition(camera, f"buffer status {status}", now_bad)
                 stream.push_buffer(buffer)
         except Exception as exc:
@@ -1303,7 +1357,7 @@ class BaumerLiveApp(tk.Tk):
         self.geometry_capture_btn_var = tk.StringVar(value="Capture chess frame 1/10")
         self.geometry_board_cols_var = tk.StringVar(value="9")
         self.geometry_board_rows_var = tk.StringVar(value="6")
-        self.preview_enabled = False
+        self.preview_enabled = True
         self.video_recording = False
         self.video_writer = None
         self.video_path: Path | None = None
@@ -2192,6 +2246,12 @@ class BaumerLiveApp(tk.Tk):
         self.video_write_fps = 0.0
         self.video_target_fps = 100.0
         self.preview_enabled = False
+        try:
+            self.preview_canvas.itemconfigure(self.canvas_image_id, image="", state="hidden")
+            self.preview_canvas.itemconfigure(self.canvas_text_id, text="Recording mode\nPreview disabled", state="normal")
+            self._on_canvas_resize(None)
+        except Exception:
+            pass
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.video_path = self.snapshot_dir / f"video_{ts}.mp4"
         self.video_writer_thread = threading.Thread(target=self._video_writer_worker, daemon=True)
@@ -2208,7 +2268,23 @@ class BaumerLiveApp(tk.Tk):
             if th.is_alive():
                 self._push_ui_event("status", "Video writer thread is still draining; stop may take longer")
         self.video_writer_thread = None
+        self.preview_enabled = True
+        if self.last_frame is not None:
+            try:
+                self._render_frame(self.last_frame)
+                self.last_render_ts = time.monotonic()
+            except Exception:
+                pass
         if not silent and was_recording:
+            if self.video_frames_written <= 0:
+                if self.video_path is not None and self.video_path.exists():
+                    try:
+                        if self.video_path.stat().st_size == 0:
+                            self.video_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                self.status_var.set("Recording stopped: 0 valid frames written (check stream status)")
+                return
             if self.video_path is not None:
                 self.status_var.set(
                     f"Video saved: {self.video_path} ({self.video_frames_written} frames, dropped={self.video_frames_dropped}, enc={self.video_encoder_name})"
