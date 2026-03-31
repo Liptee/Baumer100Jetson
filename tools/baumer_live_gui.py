@@ -945,6 +945,33 @@ class CameraWorker(threading.Thread):
         if controls:
             self._emit("controls", controls)
 
+    @staticmethod
+    def _buffer_image_bytes(buffer) -> bytes:
+        # Aravis Python API differs across versions:
+        # newer bindings expose get_image_data(), older ones may only expose get_data().
+        for getter in ("get_image_data", "get_data"):
+            fn = getattr(buffer, getter, None)
+            if fn is None:
+                continue
+            try:
+                payload = fn()
+            except Exception:
+                continue
+            if payload is None:
+                continue
+            if isinstance(payload, (bytes, bytearray, memoryview)):
+                return bytes(payload)
+            if isinstance(payload, tuple):
+                # Common shape: (data, size) or (size, data).
+                for item in payload:
+                    if isinstance(item, (bytes, bytearray, memoryview)):
+                        return bytes(item)
+            try:
+                return bytes(payload)
+            except Exception:
+                continue
+        raise RuntimeError("buffer payload API unavailable (tried get_image_data/get_data)")
+
     def run(self) -> None:
         camera = None
         stream = None
@@ -1086,7 +1113,7 @@ class CameraWorker(threading.Thread):
                 status = int(buffer.get_status())
                 if status == success_status:
                     try:
-                        raw = bytes(buffer.get_image_data())
+                        raw = self._buffer_image_bytes(buffer)
                         w = int(buffer.get_image_width())
                         h = int(buffer.get_image_height())
                         pf = int(buffer.get_image_pixel_format())
