@@ -2694,6 +2694,7 @@ class BaumerLiveApp(tk.Tk):
         self.video_write_fps = 0.0
         self.video_target_fps = 100.0
         self.preview_enabled = False
+        self.frame_var.set("Recording: waiting for first valid frame...")
         try:
             self.preview_canvas.itemconfigure(self.canvas_image_id, image="", state="hidden")
             self.preview_canvas.itemconfigure(self.canvas_text_id, text="Recording mode\nPreview disabled", state="normal")
@@ -2764,6 +2765,19 @@ class BaumerLiveApp(tk.Tk):
             return None, "invalid-size"
 
         location = str(path).replace('"', '\\"')
+        camera_pf = str(self.camera_info.get("pixel_format", "")).upper()
+        prefer_software = ("UVC" in camera_pf)
+        if prefer_software:
+            # UVC fallback path: prefer simple writer to avoid GStreamer init stalls.
+            mjpg_path = path.with_suffix(".avi")
+            wr = cv2.VideoWriter(str(mjpg_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h), True)
+            if wr.isOpened():
+                self.video_path = mjpg_path
+                return wr, "opencv-mjpg-avi"
+            wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h), True)
+            if wr.isOpened():
+                return wr, "opencv-mp4v-bgr"
+            return None, "writer-open-failed-uvc"
         gst_candidates: list[tuple[str, bool, str]] = []
         if not is_color:
             gst_candidates.append(
@@ -2823,6 +2837,7 @@ class BaumerLiveApp(tk.Tk):
                     continue
                 is_mono = len(raw) >= (w * h) and len(raw) < (w * h * 3)
                 if writer is None:
+                    self._push_ui_event("status", "Opening video writer...")
                     writer, mode = self._open_video_writer(w, h, is_color=not is_mono)
                     self.video_writer = writer
                     self.video_encoder_name = mode
@@ -4094,6 +4109,9 @@ class BaumerLiveApp(tk.Tk):
                         self._finalize_active_session("Capture stopped: camera disconnected")
         except queue.Empty:
             pass
+        except Exception as exc:
+            # Keep UI poll loop alive and expose hidden callback exceptions.
+            self.status_var.set(f"UI poll error: {exc}")
         self.after(self.ui_poll_ms, self._poll_events)
 
     def _apply_controls_dict(self, controls: dict[str, float]) -> None:
