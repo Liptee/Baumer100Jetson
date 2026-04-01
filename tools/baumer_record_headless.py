@@ -256,6 +256,48 @@ def set_controls_v4l2(dev: str, exposure_us: float, gain: float) -> None:
         log(f"v4l2-ctl set failed: {exc}")
 
 
+def set_roi_v4l2(dev: str, roi_x: int | None, roi_y: int | None, roi_center: str) -> None:
+    ctl = shutil.which("v4l2-ctl")
+    if not ctl:
+        log("v4l2-ctl not found, skipping ROI setup")
+        return
+    have_offsets = (roi_x is not None) or (roi_y is not None)
+    if not have_offsets and str(roi_center) == "auto":
+        return
+
+    ctrl_parts: list[str] = []
+    center_mode = str(roi_center).strip().lower()
+    if center_mode in ("on", "off"):
+        ctrl_parts.append(f"roi_auto_center={1 if center_mode == 'on' else 0}")
+    if have_offsets:
+        # Manual offsets require center disabled.
+        if center_mode == "auto":
+            ctrl_parts.append("roi_auto_center=0")
+        ctrl_parts.append("auto_functions_roi_control=0")
+        if roi_x is not None:
+            ctrl_parts.append(f"roi_offset_x={int(roi_x)}")
+        if roi_y is not None:
+            ctrl_parts.append(f"roi_offset_y={int(roi_y)}")
+    if not ctrl_parts:
+        return
+
+    cmd = [ctl, "--device", dev, "--set-ctrl", ",".join(ctrl_parts)]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=2.0)
+        log(f"v4l2 ROI set ok: {out.strip() or 'no output'}")
+    except Exception as exc:
+        log(f"v4l2 ROI set failed: {exc}")
+        # Best-effort fallback: set controls one by one so unsupported controls
+        # do not block the entire ROI setup.
+        for part in ctrl_parts:
+            one = [ctl, "--device", dev, "--set-ctrl", part]
+            try:
+                subprocess.check_output(one, stderr=subprocess.STDOUT, text=True, timeout=2.0)
+                log(f"v4l2 ROI partial ok: {part}")
+            except Exception as inner:
+                log(f"v4l2 ROI partial failed ({part}): {inner}")
+
+
 def set_controls_cv2(cap, exposure_us: float, gain: float) -> None:
     cv = require_cv2()
     # Try both common conventions for manual exposure.
@@ -985,6 +1027,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="", help="Force /dev/videoX (optional)")
     p.add_argument("--width", type=int, default=1024, help="Requested capture width (default: 1024)")
     p.add_argument("--height", type=int, default=768, help="Requested capture height (default: 768)")
+    p.add_argument("--roi-x", type=int, default=None, help="ROI offset X (sensor coordinates)")
+    p.add_argument("--roi-y", type=int, default=None, help="ROI offset Y (sensor coordinates)")
+    p.add_argument(
+        "--roi-center",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="ROI auto-center control (auto/on/off). If --roi-x/--roi-y are set, center is forced off.",
+    )
     p.add_argument(
         "--pixel-format",
         choices=["gray8", "y16"],
@@ -1010,7 +1060,10 @@ def main() -> int:
     serial_hint = extract_serial_hint(args.camera_id)
     log(
         f"start: duration={args.duration:.2f}s target_fps={args.target_fps:.1f} "
-        f"exposure_us={args.exposure_us:.1f} gain={args.gain:.2f} serial_hint={serial_hint or '-'}"
+        f"exposure_us={args.exposure_us:.1f} gain={args.gain:.2f} "
+        f"roi=({args.roi_x if args.roi_x is not None else '-'},"
+        f"{args.roi_y if args.roi_y is not None else '-'}) "
+        f"roi_center={args.roi_center} serial_hint={serial_hint or '-'}"
     )
 
     backend = str(args.backend)
@@ -1039,6 +1092,7 @@ def main() -> int:
             )
             return 2
         log(f"camera selected: dev={dev}, mode={args.width}x{args.height}, pixel={pixel_code}")
+        set_roi_v4l2(dev, args.roi_x, args.roi_y, str(args.roi_center))
         set_controls_v4l2(dev, args.exposure_us, args.gain)
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out_path = out_dir / f"headless_{ts}_{mode_tag}_{int(args.width)}x{int(args.height)}.raw"
@@ -1099,6 +1153,7 @@ def main() -> int:
     log(f"camera connected: dev={dev}, mode={w}x{h}, est_fps={fps_est:.1f}")
 
     # Apply controls (best-effort).
+    set_roi_v4l2(dev, args.roi_x, args.roi_y, str(args.roi_center))
     set_controls_v4l2(dev, args.exposure_us, args.gain)
     set_controls_cv2(cap, args.exposure_us, args.gain)
 
