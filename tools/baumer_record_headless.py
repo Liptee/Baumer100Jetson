@@ -6,6 +6,7 @@ import datetime as dt
 import os
 import queue
 import re
+import signal
 import shutil
 import subprocess
 import threading
@@ -279,6 +280,124 @@ def set_controls_cv2(cap, exposure_us: float, gain: float) -> None:
     log(f"cv2 controls readback: exposure={got_ex}, gain={got_gain}")
 
 
+def _stream_subprocess_output(prefix: str, pipe) -> None:
+    try:
+        for line in iter(pipe.readline, ""):
+            text = str(line).strip()
+            if text:
+                log(f"{prefix}{text}")
+    except Exception:
+        pass
+
+
+def record_gst_mjpeg(
+    device: str,
+    out_path: Path,
+    duration_s: float,
+    fps: float,
+    width: int,
+    height: int,
+) -> tuple[Path, dict[str, float]]:
+    gst = shutil.which("gst-launch-1.0")
+    if not gst:
+        raise RuntimeError("gst-launch-1.0 not found")
+    fps_i = max(1, int(round(float(fps))))
+    cmd = [
+        gst,
+        "-e",
+        "v4l2src",
+        f"device={device}",
+        "io-mode=2",
+        "do-timestamp=true",
+        "!",
+        f"image/jpeg,width={int(width)},height={int(height)},framerate={fps_i}/1",
+        "!",
+        "queue",
+        "max-size-buffers=512",
+        "leaky=downstream",
+        "!",
+        "jpegparse",
+        "!",
+        "matroskamux",
+        "!",
+        "filesink",
+        f"location={str(out_path)}",
+        "sync=false",
+    ]
+    log(f"gst start: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    reader = None
+    if proc.stdout is not None:
+        reader = threading.Thread(
+            target=_stream_subprocess_output,
+            args=("[gst] ", proc.stdout),
+            name="gst-log",
+            daemon=True,
+        )
+        reader.start()
+
+    t0 = time.monotonic()
+    last_log = 0.0
+    while True:
+        now = time.monotonic()
+        elapsed = now - t0
+        if elapsed >= float(duration_s):
+            break
+        rc = proc.poll()
+        if rc is not None:
+            raise RuntimeError(f"gst exited early with code {rc}")
+        if elapsed - last_log >= 1.0:
+            last_log = elapsed
+            size_mb = 0.0
+            try:
+                size_mb = out_path.stat().st_size / (1024.0 * 1024.0)
+            except Exception:
+                pass
+            log(f"gst telemetry: elapsed={elapsed:.1f}s size={size_mb:.1f}MB")
+        time.sleep(0.05)
+
+    try:
+        proc.send_signal(signal.SIGINT)
+    except Exception:
+        pass
+    try:
+        rc = proc.wait(timeout=15.0)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            rc = proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait(timeout=3.0)
+    if reader is not None:
+        reader.join(timeout=2.0)
+    if rc not in (0, 130):
+        raise RuntimeError(f"gst failed with code {rc}")
+
+    elapsed_total = max(1e-6, time.monotonic() - t0)
+    size_b = float(out_path.stat().st_size if out_path.exists() else 0)
+    est_write_fps = float(size_b / max(1.0, (width * height))) / elapsed_total
+    stats = {
+        "elapsed_s": elapsed_total,
+        "read": 0.0,
+        "enq": 0.0,
+        "written": 0.0,
+        "q_drop": 0.0,
+        "read_fail": 0.0,
+        "write_fail": 0.0,
+        "read_fps_avg": float(fps),
+        "write_fps_avg": est_write_fps,
+        "backend_gst": 1.0,
+    }
+    return out_path, stats
+
+
 def open_writer(path: Path, w: int, h: int, fps: float):
     cv = require_cv2()
     location = str(path).replace('"', '\\"')
@@ -405,11 +524,12 @@ def record_headless(
             read_window = 0
             t_win = now
 
+    capture_elapsed = max(1e-6, time.monotonic() - t0)
     read_done.set()
     stop_event.set()
-    wt.join(timeout=max(4.0, duration_s * 1.2))
-    if wt.is_alive():
-        log("writer still draining after timeout")
+    while wt.is_alive():
+        log(f"writer draining: q={q.qsize()}/{q.maxsize}, written={int(stats['written'])}")
+        wt.join(timeout=1.0)
     try:
         writer.release()
     except Exception:
@@ -417,9 +537,11 @@ def record_headless(
 
     elapsed = max(1e-6, time.monotonic() - t0)
     with lock:
+        stats["capture_elapsed_s"] = capture_elapsed
         stats["elapsed_s"] = elapsed
-        stats["read_fps_avg"] = stats["read"] / elapsed
-        stats["write_fps_avg"] = stats["written"] / elapsed
+        stats["read_fps_avg"] = stats["read"] / capture_elapsed
+        stats["write_fps_avg"] = stats["written"] / capture_elapsed
+        stats["write_fps_overall"] = stats["written"] / elapsed
         stats["queue_left"] = float(q.qsize())
     return actual_path, stats
 
@@ -437,6 +559,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-mode", action="store_true", help="Probe multiple camera modes and auto-select one")
     p.add_argument("--snapshot-dir", default="capture", help="Output directory")
     p.add_argument("--queue-size", type=int, default=512, help="Frame queue size")
+    p.add_argument(
+        "--backend",
+        choices=["auto", "gst-mjpeg", "opencv"],
+        default="auto",
+        help="Recording backend: auto (prefer gst-mjpeg), gst-mjpeg, opencv",
+    )
     return p.parse_args()
 
 
@@ -472,20 +600,67 @@ def main() -> int:
     set_controls_cv2(cap, args.exposure_us, args.gain)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_path = out_dir / f"headless_{ts}.mp4"
-    try:
-        saved_path, stats = record_headless(
-            cap=cap,
-            out_path=out_path,
-            duration_s=float(args.duration),
-            target_fps=float(args.target_fps),
-            queue_size=int(args.queue_size),
-        )
-    finally:
+    backend = str(args.backend)
+    if backend == "auto":
+        backend = "gst-mjpeg" if shutil.which("gst-launch-1.0") else "opencv"
+    log(f"record backend: {backend}")
+
+    saved_path: Path
+    stats: dict[str, float]
+    if backend == "gst-mjpeg":
         try:
             cap.release()
         except Exception:
             pass
+        out_path = out_dir / f"headless_{ts}.mkv"
+        try:
+            saved_path, stats = record_gst_mjpeg(
+                device=dev,
+                out_path=out_path,
+                duration_s=float(args.duration),
+                fps=float(args.target_fps),
+                width=w,
+                height=h,
+            )
+        except Exception as exc:
+            if str(args.backend) == "gst-mjpeg":
+                log(f"failed: gst-mjpeg backend error: {exc}")
+                return 3
+            log(f"gst-mjpeg failed ({exc}), fallback to opencv backend")
+            cap = require_cv2().VideoCapture(dev, require_cv2().CAP_V4L2)
+            if not cap.isOpened():
+                log("failed: cannot reopen camera for opencv fallback")
+                return 4
+            configure_uvc_mode(cap, w, h, float(args.target_fps))
+            out_path = out_dir / f"headless_{ts}.mp4"
+            try:
+                saved_path, stats = record_headless(
+                    cap=cap,
+                    out_path=out_path,
+                    duration_s=float(args.duration),
+                    target_fps=float(args.target_fps),
+                    queue_size=int(args.queue_size),
+                )
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+    else:
+        out_path = out_dir / f"headless_{ts}.mp4"
+        try:
+            saved_path, stats = record_headless(
+                cap=cap,
+                out_path=out_path,
+                duration_s=float(args.duration),
+                target_fps=float(args.target_fps),
+                queue_size=int(args.queue_size),
+            )
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     log(
         "done: "
