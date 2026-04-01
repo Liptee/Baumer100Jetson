@@ -510,8 +510,26 @@ def record_gst_raw(
                 break
             rc = proc.poll()
             if rc is not None:
+                size_b_now = float(out_path.stat().st_size if out_path.exists() else 0.0)
+                frames_est_now = float(size_b_now / float(frame_bytes))
+                fps_est_now = float(frames_est_now / max(1e-6, elapsed))
+                early_good = (
+                    elapsed >= float(duration_s) * 0.80
+                    and fps_est_now >= max(1.0, float(min_fps) * 0.50)
+                    and size_b_now >= float(frame_bytes) * max(1.0, float(min_fps) * float(duration_s) * 0.25)
+                )
+                if early_good:
+                    log(
+                        "gst raw finished before timer but accepted: "
+                        f"rc={rc}, elapsed={elapsed:.3f}s, fps_est={fps_est_now:.1f}"
+                    )
+                    ok = True
+                    break
                 ok = False
-                last_err = f"gst exited early with code {rc} at fps={fps_i}"
+                last_err = (
+                    f"gst exited early with code {rc} at fps={fps_i}; "
+                    f"elapsed={elapsed:.3f}s fps_est={fps_est_now:.1f}"
+                )
                 break
             if elapsed - last_log >= 1.0:
                 last_log = elapsed
