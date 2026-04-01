@@ -26,6 +26,7 @@ import struct
 import subprocess
 import threading
 import time
+import traceback
 import tkinter as tk
 import zlib
 from dataclasses import dataclass
@@ -40,6 +41,23 @@ DEFAULT_PREVIEW_FPS = 100.0
 DEFAULT_UI_POLL_MS = 5
 DEFAULT_PREVIEW_MAX_W = 640
 DEFAULT_PREVIEW_MAX_H = 480
+TERMINAL_DEBUG_ENABLED = True
+
+
+def set_terminal_debug(enabled: bool) -> None:
+    global TERMINAL_DEBUG_ENABLED
+    TERMINAL_DEBUG_ENABLED = bool(enabled)
+
+
+def terminal_debug(tag: str, message: str) -> None:
+    if not TERMINAL_DEBUG_ENABLED:
+        return
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    thread_name = threading.current_thread().name
+    try:
+        print(f"[{ts}] [{thread_name}] [{tag}] {message}", flush=True)
+    except Exception:
+        pass
 
 try:
     from baumer_force_ip import send_force_ip as gvcp_force_ip
@@ -795,19 +813,27 @@ class CameraWorker(threading.Thread):
         self._last_good_frame_ts = 0.0
         self._last_restart_ts = 0.0
         self._last_bad_status_log_ts = 0.0
+        self._last_frame_drop_log_ts = 0.0
 
     def stop(self) -> None:
         self.stop_event.set()
+        terminal_debug("worker", "stop requested")
 
     def _emit(self, kind: str, payload: object | None = None) -> None:
         if kind == "frame":
             # Keep memory bounded; allow a deeper queue so recorder can keep up at 100 fps.
             if self.event_q.qsize() > 384:
+                now = time.monotonic()
+                if (now - self._last_frame_drop_log_ts) > 1.0:
+                    self._last_frame_drop_log_ts = now
+                    terminal_debug("worker", f"dropping frame event; event_q={self.event_q.qsize()}")
                 return
+        elif kind in ("status", "error", "connected", "disconnected"):
+            terminal_debug("worker", f"{kind}: {payload}")
         try:
             self.event_q.put_nowait((kind, payload))
         except queue.Full:
-            pass
+            terminal_debug("worker", f"event_q full while emitting {kind}")
 
     def _read_controls(self, camera) -> dict[str, float] | None:
         out: dict[str, float] = {}
@@ -1293,6 +1319,7 @@ class CameraWorker(threading.Thread):
         if cv2 is None:
             return None, ""
         candidates = self._find_uvc_video_candidates()
+        terminal_debug("uvc", f"video candidates: {candidates}")
         for dev in candidates:
             cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
             if not cap.isOpened():
@@ -1320,6 +1347,7 @@ class CameraWorker(threading.Thread):
                     ok = True
                     break
             if ok:
+                terminal_debug("uvc", f"opened {dev}: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)} @ {float(cap.get(cv2.CAP_PROP_FPS) or 0.0):.1f}")
                 return cap, dev
             try:
                 cap.release()
@@ -1336,6 +1364,7 @@ class CameraWorker(threading.Thread):
             self._emit("status", "UVC fallback failed: no readable /dev/video device")
             return False
         self._emit("status", f"UVC fallback active on {dev}")
+        terminal_debug("uvc", f"fallback loop active on {dev}")
         try:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -1370,6 +1399,7 @@ class CameraWorker(threading.Thread):
                 ret, frm = cap.read()
                 if not ret or frm is None:
                     self._emit("status", "UVC read timeout")
+                    terminal_debug("uvc", "read timeout")
                     continue
                 try:
                     hh, ww = int(frm.shape[0]), int(frm.shape[1])
@@ -1390,6 +1420,7 @@ class CameraWorker(threading.Thread):
         disconnect_reason = ""
         switch_to_uvc_fallback = False
         target_fps = 100.0
+        terminal_debug("worker", f"run started: camera_ip={self.camera_ip}, interface={self.interface}, buffers={self.buffers}")
         try:
             import gi
 
@@ -1417,6 +1448,7 @@ class CameraWorker(threading.Thread):
             camera, open_note = open_camera_with_fallback(Aravis, self.camera_ip, self.interface)
             if camera is None:
                 raise RuntimeError(f"Camera not found at {self.camera_ip}: {open_note}")
+            terminal_debug("worker", f"camera opened: note={open_note}")
             if open_note:
                 self._emit("status", f"Connect note: {open_note}")
             self._try_take_control(camera)
@@ -1486,6 +1518,7 @@ class CameraWorker(threading.Thread):
             if payload_raw <= 0:
                 raise RuntimeError("Invalid payload size")
             payload_alloc = int(payload_raw + max(65536, payload_raw // 8))
+            terminal_debug("worker", f"payload raw={payload_raw}, alloc={payload_alloc}, stream_buffers={max(2, self.buffers)}")
 
             for _ in range(max(2, self.buffers)):
                 stream.push_buffer(Aravis.Buffer.new_allocate(payload_alloc))
@@ -1521,6 +1554,7 @@ class CameraWorker(threading.Thread):
             except Exception:
                 pass
             camera.start_acquisition()
+            terminal_debug("worker", "acquisition started")
             now_mono = time.monotonic()
             self._last_good_frame_ts = now_mono
             self._last_restart_ts = now_mono
@@ -1663,6 +1697,7 @@ class CameraWorker(threading.Thread):
                             and bad_status_streak >= 28
                         ):
                             self._emit("status", "Aravis USB stream failed, switching to UVC fallback backend")
+                            terminal_debug("worker", "switch_to_uvc_fallback triggered")
                             switch_to_uvc_fallback = True
                             try:
                                 camera.stop_acquisition()
@@ -1675,6 +1710,7 @@ class CameraWorker(threading.Thread):
                     break
         except Exception as exc:
             disconnect_reason = str(exc)
+            terminal_debug("worker", f"run exception: {exc}\n{traceback.format_exc()}")
             self._emit("error", str(exc))
         finally:
             if camera is not None:
@@ -1683,6 +1719,7 @@ class CameraWorker(threading.Thread):
                 except Exception:
                     pass
             if switch_to_uvc_fallback:
+                terminal_debug("worker", "starting UVC fallback loop")
                 ok = self._run_uvc_fallback_loop(target_fps)
                 if not ok:
                     self._emit("disconnected", {"reason": "UVC fallback failed"})
@@ -1704,6 +1741,7 @@ class BaumerLiveApp(tk.Tk):
         packet_delay: int = DEFAULT_PACKET_DELAY,
         preview_fps: float = DEFAULT_PREVIEW_FPS,
         ui_poll_ms: int = DEFAULT_UI_POLL_MS,
+        debug_terminal: bool = True,
     ) -> None:
         super().__init__()
         self.title("Baumer Live Viewer")
@@ -1717,6 +1755,8 @@ class BaumerLiveApp(tk.Tk):
         self.status_var = tk.StringVar(value="Idle")
         self.info_var = tk.StringVar(value="-")
         self.frame_var = tk.StringVar(value="-")
+        self.debug_terminal = bool(debug_terminal)
+        self._last_frame_trace_ts = 0.0
         self.profile_names = list_profile_names() if (SCIENTIFIC_CAPTURE_AVAILABLE and list_profile_names) else ["scene_capture"]
         self.capture_profile_var = tk.StringVar(value=self.profile_names[0])
         self.session_dir_var = tk.StringVar(value=str(self.snapshot_dir))
@@ -1822,9 +1862,16 @@ class BaumerLiveApp(tk.Tk):
         self.video_writer_thread: threading.Thread | None = None
 
         self._build_ui()
+        self.status_var.trace_add("write", self._on_status_trace)
+        self.frame_var.trace_add("write", self._on_frame_trace)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(self.ui_poll_ms, self._poll_events)
         self.after(150, self._startup_connect)
+        self.after(1000, self._debug_heartbeat)
+        terminal_debug(
+            "app",
+            f"started: camera={camera_ip or '<auto>'}, snapshot_dir={self.snapshot_dir}, ui_poll_ms={self.ui_poll_ms}, preview_fps={preview_fps}",
+        )
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=8)
@@ -1949,6 +1996,51 @@ class BaumerLiveApp(tk.Tk):
         ttk.Label(right, textvariable=self.status_var, wraplength=280, justify="left").grid(
             row=13, column=0, sticky="w", padx=8, pady=(2, 8)
         )
+
+    def _on_status_trace(self, *_args: object) -> None:
+        if not self.debug_terminal:
+            return
+        try:
+            msg = self.status_var.get()
+        except Exception:
+            return
+        terminal_debug("status", msg)
+
+    def _on_frame_trace(self, *_args: object) -> None:
+        if not self.debug_terminal:
+            return
+        now = time.monotonic()
+        if (now - self._last_frame_trace_ts) < 0.5:
+            return
+        self._last_frame_trace_ts = now
+        try:
+            msg = self.frame_var.get()
+        except Exception:
+            return
+        if msg:
+            terminal_debug("frame", msg.replace("\n", " | "))
+
+    def _debug_heartbeat(self) -> None:
+        try:
+            if self.debug_terminal:
+                worker_alive = bool(self.worker and self.worker.is_alive())
+                last_shape = "-"
+                if self.last_frame is not None:
+                    last_shape = f"{self.last_frame.width}x{self.last_frame.height}"
+                terminal_debug(
+                    "hb",
+                    (
+                        f"worker={worker_alive} rec={self.video_recording} "
+                        f"event_q={self.event_q.qsize()} cmd_q={self.cmd_q.qsize()} "
+                        f"video_q={self.video_queue.qsize()} rx={self._rx_fps:.1f} write={self.video_write_fps:.1f} "
+                        f"enq={self.video_frames_enqueued} wr={self.video_frames_written} drop={self.video_frames_dropped} "
+                        f"last_frame={last_shape} enc={self.video_encoder_name}"
+                    ),
+                )
+        except Exception as exc:
+            terminal_debug("hb", f"heartbeat error: {exc}")
+        finally:
+            self.after(1000, self._debug_heartbeat)
 
     def _on_right_canvas_configure(self, event: tk.Event) -> None:
         try:
@@ -2168,6 +2260,7 @@ class BaumerLiveApp(tk.Tk):
         self._scan_cameras(auto_connect=True)
 
     def _connect(self) -> None:
+        terminal_debug("ui", f"connect requested: camera={self.camera_var.get().strip()}")
         if self.worker and self.worker.is_alive():
             self.status_var.set("Already connected")
             return
@@ -2191,6 +2284,7 @@ class BaumerLiveApp(tk.Tk):
         self.worker.start()
 
     def _disconnect(self) -> None:
+        terminal_debug("ui", "disconnect requested")
         self._stop_video_recording(silent=True)
         if self.active_session_writer is not None:
             self._finalize_active_session("Capture stopped")
@@ -2211,7 +2305,7 @@ class BaumerLiveApp(tk.Tk):
         try:
             self.event_q.put_nowait((kind, payload))
         except queue.Full:
-            pass
+            terminal_debug("ui", f"event_q full while pushing {kind}")
 
     @staticmethod
     def _parse_arv_list_output(text: str) -> list[tuple[str, str]]:
@@ -2662,6 +2756,7 @@ class BaumerLiveApp(tk.Tk):
         self.status_var.set("Snapshot is disabled. Use Start REC / Stop REC.")
 
     def _start_video_recording(self) -> None:
+        terminal_debug("rec", "start requested")
         if self.video_recording:
             self.status_var.set("Video recording is already running")
             return
@@ -2708,6 +2803,7 @@ class BaumerLiveApp(tk.Tk):
         self.status_var.set("Video recording started (target=100 fps)")
 
     def _stop_video_recording(self, silent: bool = False) -> None:
+        terminal_debug("rec", f"stop requested (silent={silent})")
         was_recording = self.video_recording
         self.video_recording = False
         self.video_stop_event.set()
@@ -2733,13 +2829,19 @@ class BaumerLiveApp(tk.Tk):
                     except Exception:
                         pass
                 self.status_var.set("Recording stopped: 0 valid frames written (check stream status)")
+                terminal_debug("rec", "stopped with 0 written frames")
                 return
             if self.video_path is not None:
                 self.status_var.set(
                     f"Video saved: {self.video_path} ({self.video_frames_written} frames, dropped={self.video_frames_dropped}, enc={self.video_encoder_name})"
                 )
+                terminal_debug(
+                    "rec",
+                    f"saved: path={self.video_path}, frames={self.video_frames_written}, dropped={self.video_frames_dropped}, enc={self.video_encoder_name}",
+                )
             else:
                 self.status_var.set(f"Video recording stopped ({self.video_frames_written} frames)")
+                terminal_debug("rec", f"stopped: frames={self.video_frames_written}")
 
     def _enqueue_video_frame(self, frame: FramePacket) -> None:
         if not self.video_recording:
@@ -2822,11 +2924,14 @@ class BaumerLiveApp(tk.Tk):
 
     def _video_writer_worker(self) -> None:
         if cv2 is None or np is None:
+            terminal_debug("writer", "worker exit: cv2/np unavailable")
             return
         writer = None
         mode = "none"
         window_start = time.monotonic()
         window_written = 0
+        last_write_error_log_ts = 0.0
+        terminal_debug("writer", "worker started")
         try:
             while not self.video_stop_event.is_set() or not self.video_queue.empty():
                 try:
@@ -2847,7 +2952,9 @@ class BaumerLiveApp(tk.Tk):
                         self.video_recording = False
                         self.video_stop_event.set()
                         self._push_ui_event("status", f"Video writer failed: {mode}")
+                        terminal_debug("writer", f"open failed: mode={mode}, size={w}x{h}, pf={pf_upper}")
                         return
+                    terminal_debug("writer", f"opened: mode={mode}, size={w}x{h}, mono={is_mono}, pf={pf_upper}")
                     self._push_ui_event("status", f"Recording started: encoder={mode}, {w}x{h}@{self.video_target_fps:.1f}fps")
                 try:
                     if is_mono:
@@ -2871,6 +2978,10 @@ class BaumerLiveApp(tk.Tk):
                         window_written = 0
                 except Exception:
                     self.video_frames_dropped += 1
+                    now = time.monotonic()
+                    if (now - last_write_error_log_ts) > 1.0:
+                        last_write_error_log_ts = now
+                        terminal_debug("writer", f"write error:\n{traceback.format_exc()}")
         finally:
             if writer is not None:
                 try:
@@ -2878,6 +2989,10 @@ class BaumerLiveApp(tk.Tk):
                 except Exception:
                     pass
             self.video_writer = None
+            terminal_debug(
+                "writer",
+                f"worker finished: written={self.video_frames_written}, enq={self.video_frames_enqueued}, dropped={self.video_frames_dropped}, mode={mode}",
+            )
 
     def _set_calibration_panel_visible(self, visible: bool) -> None:
         if not hasattr(self, "calibration_panel"):
@@ -4112,6 +4227,7 @@ class BaumerLiveApp(tk.Tk):
         except Exception as exc:
             # Keep UI poll loop alive and expose hidden callback exceptions.
             self.status_var.set(f"UI poll error: {exc}")
+            terminal_debug("ui", f"_poll_events exception: {exc}\n{traceback.format_exc()}")
         self.after(self.ui_poll_ms, self._poll_events)
 
     def _apply_controls_dict(self, controls: dict[str, float]) -> None:
@@ -4236,6 +4352,7 @@ class BaumerLiveApp(tk.Tk):
             )
 
     def _on_close(self) -> None:
+        terminal_debug("app", "close requested")
         if self.active_session_writer is not None:
             self._finalize_active_session("Capture stopped")
         self._disconnect()
@@ -4258,11 +4375,25 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_UI_POLL_MS,
         help="UI event polling period in milliseconds",
     )
+    parser.add_argument(
+        "--debug-terminal",
+        action="store_true",
+        default=True,
+        help="Print debug diagnostics to terminal (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-debug-terminal",
+        dest="debug_terminal",
+        action="store_false",
+        help="Disable terminal debug diagnostics",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    set_terminal_debug(bool(args.debug_terminal))
+    terminal_debug("main", f"args: {args}")
     app = BaumerLiveApp(
         interface="",
         camera_ip=args.camera,
@@ -4271,6 +4402,7 @@ def main() -> int:
         packet_delay=DEFAULT_PACKET_DELAY,
         preview_fps=args.preview_fps,
         ui_poll_ms=args.ui_poll_ms,
+        debug_terminal=bool(args.debug_terminal),
     )
     app.mainloop()
     return 0
