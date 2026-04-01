@@ -1845,7 +1845,8 @@ class BaumerLiveApp(tk.Tk):
         self.geometry_capture_btn_var = tk.StringVar(value="Capture chess frame 1/10")
         self.geometry_board_cols_var = tk.StringVar(value="9")
         self.geometry_board_rows_var = tk.StringVar(value="6")
-        self.preview_enabled = True
+        # Capture-first mode for Jetson stability: disable GUI preview by default.
+        self.preview_enabled = False
         self.video_recording = False
         self.video_writer = None
         self.video_path: Path | None = None
@@ -1862,6 +1863,16 @@ class BaumerLiveApp(tk.Tk):
         self.video_writer_thread: threading.Thread | None = None
 
         self._build_ui()
+        if not self.preview_enabled:
+            try:
+                self.preview_canvas.itemconfigure(
+                    self.canvas_text_id,
+                    text="Preview disabled\n(capture-first mode)",
+                    state="normal",
+                )
+                self.preview_canvas.itemconfigure(self.canvas_image_id, image="", state="hidden")
+            except Exception:
+                pass
         self.status_var.trace_add("write", self._on_status_trace)
         self.frame_var.trace_add("write", self._on_frame_trace)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2789,6 +2800,15 @@ class BaumerLiveApp(tk.Tk):
         self.video_write_fps = 0.0
         self.video_target_fps = 100.0
         self.preview_enabled = False
+        dropped_events = 0
+        while True:
+            try:
+                self.event_q.get_nowait()
+                dropped_events += 1
+            except queue.Empty:
+                break
+        if dropped_events:
+            terminal_debug("rec", f"cleared stale event backlog before REC: {dropped_events} events")
         self.frame_var.set("Recording: waiting for first valid frame...")
         try:
             self.preview_canvas.itemconfigure(self.canvas_image_id, image="", state="hidden")
@@ -2813,13 +2833,17 @@ class BaumerLiveApp(tk.Tk):
             if th.is_alive():
                 self._push_ui_event("status", "Video writer thread is still draining; stop may take longer")
         self.video_writer_thread = None
-        self.preview_enabled = True
-        if self.last_frame is not None:
-            try:
-                self._render_frame(self.last_frame)
-                self.last_render_ts = time.monotonic()
-            except Exception:
-                pass
+        self.preview_enabled = False
+        try:
+            self.preview_canvas.itemconfigure(
+                self.canvas_text_id,
+                text="Preview disabled\n(capture-first mode)",
+                state="normal",
+            )
+            self.preview_canvas.itemconfigure(self.canvas_image_id, image="", state="hidden")
+            self._on_canvas_resize(None)
+        except Exception:
+            pass
         if not silent and was_recording:
             if self.video_frames_written <= 0:
                 if self.video_path is not None and self.video_path.exists():
