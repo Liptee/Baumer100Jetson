@@ -94,6 +94,15 @@ def find_uvc_candidates(serial_hint: str = "") -> list[str]:
 
 def configure_uvc_mode(cap, req_w: int, req_h: int, target_fps: float) -> tuple[int, int, float]:
     cv = require_cv2()
+    try:
+        cap.set(cv.CAP_PROP_CONVERT_RGB, 0.0)
+    except Exception:
+        pass
+    # Prefer native monochrome path from camera (GREY 8-bit).
+    try:
+        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"GREY"))
+    except Exception:
+        pass
     cap.set(cv.CAP_PROP_FRAME_WIDTH, float(req_w))
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, float(req_h))
     cap.set(cv.CAP_PROP_FPS, float(target_fps))
@@ -158,11 +167,6 @@ def try_open_uvc(
             continue
         try:
             cap.set(cv.CAP_PROP_BUFFERSIZE, 2)
-        except Exception:
-            pass
-        # Prefer MJPG at camera side for USB throughput.
-        try:
-            cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"MJPG"))
         except Exception:
             pass
         local_best = None
@@ -280,6 +284,66 @@ def set_controls_cv2(cap, exposure_us: float, gain: float) -> None:
     log(f"cv2 controls readback: exposure={got_ex}, gain={got_gain}")
 
 
+def _gst_has_element(name: str) -> bool:
+    inspect = shutil.which("gst-inspect-1.0")
+    if not inspect:
+        return False
+    try:
+        cp = subprocess.run(
+            [inspect, name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2.0,
+        )
+        return cp.returncode == 0
+    except Exception:
+        return False
+
+
+def _v4l2_supported_fps(device: str, width: int, height: int, pixel_code: str = "GREY") -> list[int]:
+    ctl = shutil.which("v4l2-ctl")
+    if not ctl:
+        return []
+    try:
+        out = subprocess.check_output(
+            [ctl, "-d", device, "--list-formats-ext"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3.0,
+        )
+    except Exception:
+        return []
+
+    wanted = pixel_code.strip().upper()
+    in_fmt = False
+    in_size = False
+    vals: list[int] = []
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        m_fmt = re.search(r"\[\d+\]:\s*'([^']+)'", line)
+        if m_fmt:
+            in_fmt = (m_fmt.group(1).strip().upper() == wanted)
+            in_size = False
+            continue
+        if not in_fmt:
+            continue
+        m_size = re.search(r"Size:\s*Discrete\s*(\d+)x(\d+)", line)
+        if m_size:
+            in_size = (int(m_size.group(1)) == int(width) and int(m_size.group(2)) == int(height))
+            continue
+        if not in_size:
+            continue
+        m_fps = re.search(r"\(([\d.]+)\s*fps\)", line, flags=re.IGNORECASE)
+        if not m_fps:
+            continue
+        fps_i = int(round(float(m_fps.group(1))))
+        if fps_i > 0 and fps_i not in vals:
+            vals.append(fps_i)
+    vals.sort(reverse=True)
+    return vals
+
+
 def _stream_subprocess_output(prefix: str, pipe) -> None:
     try:
         for line in iter(pipe.readline, ""):
@@ -297,88 +361,189 @@ def record_gst_mjpeg(
     fps: float,
     width: int,
     height: int,
+    fps_hint: float = 0.0,
 ) -> tuple[Path, dict[str, float]]:
     gst = shutil.which("gst-launch-1.0")
     if not gst:
         raise RuntimeError("gst-launch-1.0 not found")
-    fps_i = max(1, int(round(float(fps))))
-    cmd = [
-        gst,
-        "-e",
-        "v4l2src",
-        f"device={device}",
-        "io-mode=2",
-        "do-timestamp=true",
-        "!",
-        f"image/jpeg,width={int(width)},height={int(height)},framerate={fps_i}/1",
-        "!",
-        "queue",
-        "max-size-buffers=512",
-        "leaky=downstream",
-        "!",
-        "jpegparse",
-        "!",
-        "matroskamux",
-        "!",
-        "filesink",
-        f"location={str(out_path)}",
-        "sync=false",
-    ]
-    log(f"gst start: {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    reader = None
-    if proc.stdout is not None:
-        reader = threading.Thread(
-            target=_stream_subprocess_output,
-            args=("[gst] ", proc.stdout),
-            name="gst-log",
-            daemon=True,
-        )
-        reader.start()
 
+    fps_candidates: list[int] = []
+
+    def add_fps(v: float) -> None:
+        iv = int(round(float(v)))
+        if iv > 0 and iv not in fps_candidates:
+            fps_candidates.append(iv)
+
+    # First, trust camera-reported discrete fps for this exact mode.
+    for vv in _v4l2_supported_fps(device, int(width), int(height), "GREY"):
+        add_fps(vv)
+    add_fps(fps)
+    add_fps(fps_hint)
+    add_fps(120)
+    add_fps(100)
+    add_fps(90)
+    add_fps(80)
+    add_fps(60)
+    add_fps(30)
+
+    used_fps = 0
     t0 = time.monotonic()
-    last_log = 0.0
-    while True:
-        now = time.monotonic()
-        elapsed = now - t0
-        if elapsed >= float(duration_s):
-            break
-        rc = proc.poll()
-        if rc is not None:
-            raise RuntimeError(f"gst exited early with code {rc}")
-        if elapsed - last_log >= 1.0:
-            last_log = elapsed
-            size_mb = 0.0
-            try:
-                size_mb = out_path.stat().st_size / (1024.0 * 1024.0)
-            except Exception:
-                pass
-            log(f"gst telemetry: elapsed={elapsed:.1f}s size={size_mb:.1f}MB")
-        time.sleep(0.05)
+    last_err = "unknown"
+    has_nv = _gst_has_element("nvv4l2h264enc") and _gst_has_element("nvvidconv")
+    has_x264 = _gst_has_element("x264enc")
+    encoder_modes = ["jetson-h264-hw", "x264-sw", "raw-mkv"]
+    for enc_mode in encoder_modes:
+        if enc_mode == "jetson-h264-hw" and not has_nv:
+            continue
+        if enc_mode == "x264-sw" and not has_x264:
+            continue
+        for fps_i in fps_candidates:
+            common = [
+                gst,
+                "-e",
+                "v4l2src",
+                f"device={device}",
+                "io-mode=2",
+                "do-timestamp=true",
+                "!",
+                f"video/x-raw,format=GRAY8,width={int(width)},height={int(height)},framerate={fps_i}/1",
+                "!",
+                "queue",
+                "max-size-buffers=1024",
+                "leaky=downstream",
+                "!",
+                "videoconvert",
+                "!",
+            ]
+            if enc_mode == "jetson-h264-hw":
+                tail = [
+                    "video/x-raw,format=I420",
+                    "!",
+                    "nvvidconv",
+                    "!",
+                    "video/x-raw(memory:NVMM),format=NV12",
+                    "!",
+                    "nvv4l2h264enc",
+                    "maxperf-enable=1",
+                    "control-rate=1",
+                    "bitrate=40000000",
+                    "iframeinterval=120",
+                    "idrinterval=120",
+                    "insert-sps-pps=true",
+                    "!",
+                    "h264parse",
+                    "!",
+                    "matroskamux",
+                ]
+            elif enc_mode == "x264-sw":
+                tail = [
+                    "video/x-raw,format=I420",
+                    "!",
+                    "x264enc",
+                    "speed-preset=ultrafast",
+                    "tune=zerolatency",
+                    "bitrate=40000",
+                    "key-int-max=120",
+                    "!",
+                    "h264parse",
+                    "!",
+                    "matroskamux",
+                ]
+            else:
+                tail = [
+                    "video/x-raw,format=I420",
+                    "!",
+                    "matroskamux",
+                ]
+            cmd = common + tail + [
+                "!",
+                "filesink",
+                f"location={str(out_path)}",
+                "sync=false",
+            ]
+            log(f"gst start (enc={enc_mode}, fps={fps_i}): {' '.join(cmd)}")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            reader = None
+            if proc.stdout is not None:
+                reader = threading.Thread(
+                    target=_stream_subprocess_output,
+                    args=("[gst] ", proc.stdout),
+                    name="gst-log",
+                    daemon=True,
+                )
+                reader.start()
 
-    try:
-        proc.send_signal(signal.SIGINT)
-    except Exception:
-        pass
-    try:
-        rc = proc.wait(timeout=15.0)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            rc = proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc = proc.wait(timeout=3.0)
-    if reader is not None:
-        reader.join(timeout=2.0)
-    if rc not in (0, 130):
-        raise RuntimeError(f"gst failed with code {rc}")
+            attempt_t0 = time.monotonic()
+            ok = True
+            last_log = 0.0
+            while True:
+                now = time.monotonic()
+                elapsed = now - attempt_t0
+                if elapsed >= float(duration_s):
+                    break
+                rc = proc.poll()
+                if rc is not None:
+                    ok = False
+                    last_err = f"gst exited early with code {rc} at fps={fps_i} enc={enc_mode}"
+                    break
+                if elapsed - last_log >= 1.0:
+                    last_log = elapsed
+                    size_mb = 0.0
+                    try:
+                        size_mb = out_path.stat().st_size / (1024.0 * 1024.0)
+                    except Exception:
+                        pass
+                    log(f"gst telemetry: elapsed={elapsed:.1f}s size={size_mb:.1f}MB")
+                time.sleep(0.05)
+
+            if ok:
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+                try:
+                    rc = proc.wait(timeout=15.0)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    try:
+                        rc = proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        rc = proc.wait(timeout=3.0)
+                if reader is not None:
+                    reader.join(timeout=2.0)
+                if rc in (0, 130):
+                    used_fps = fps_i
+                    log(f"gst mode selected: enc={enc_mode}, fps={used_fps}")
+                    break
+                last_err = f"gst failed with code {rc} at fps={fps_i} enc={enc_mode}"
+            else:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+                if reader is not None:
+                    reader.join(timeout=1.0)
+                try:
+                    out_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                time.sleep(0.15)
+        if used_fps > 0:
+            break
+
+    if used_fps <= 0:
+        raise RuntimeError(last_err)
 
     elapsed_total = max(1e-6, time.monotonic() - t0)
     size_b = float(out_path.stat().st_size if out_path.exists() else 0)
@@ -391,10 +556,12 @@ def record_gst_mjpeg(
         "q_drop": 0.0,
         "read_fail": 0.0,
         "write_fail": 0.0,
-        "read_fps_avg": float(fps),
+        "read_fps_avg": float(used_fps),
         "write_fps_avg": est_write_fps,
         "backend_gst": 1.0,
+        "capture_fps_used": float(used_fps),
     }
+    log(f"gst done: capture_fps_used={used_fps}")
     return out_path, stats
 
 
@@ -563,7 +730,7 @@ def parse_args() -> argparse.Namespace:
         "--backend",
         choices=["auto", "gst-mjpeg", "opencv"],
         default="auto",
-        help="Recording backend: auto (prefer gst-mjpeg), gst-mjpeg, opencv",
+        help="Recording backend: auto (prefer gst raw/h264 path), gst-mjpeg, opencv",
     )
     return p.parse_args()
 
@@ -593,7 +760,11 @@ def main() -> int:
     w = int(opened["w"])
     h = int(opened["h"])
     fps_est = float(opened["fps_est"])
+    fps_prop = float(opened.get("fps_prop", 0.0) or 0.0)
     log(f"camera connected: dev={dev}, mode={w}x{h}, est_fps={fps_est:.1f}")
+    fps_disc = _v4l2_supported_fps(dev, w, h, "GREY")
+    if fps_disc:
+        log(f"v4l2 GREY discrete fps for {w}x{h}: {fps_disc}")
 
     # Apply controls (best-effort).
     set_controls_v4l2(dev, args.exposure_us, args.gain)
@@ -621,6 +792,7 @@ def main() -> int:
                 fps=float(args.target_fps),
                 width=w,
                 height=h,
+                fps_hint=(fps_prop if fps_prop > 0 else fps_est),
             )
         except Exception as exc:
             if str(args.backend) == "gst-mjpeg":
