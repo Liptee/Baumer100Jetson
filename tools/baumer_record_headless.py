@@ -387,6 +387,40 @@ def _v4l2_supported_fps(device: str, width: int, height: int, pixel_code: str = 
     return vals
 
 
+def _v4l2_supported_sizes(device: str, pixel_code: str = "GREY") -> list[tuple[int, int]]:
+    ctl = shutil.which("v4l2-ctl")
+    if not ctl:
+        return []
+    try:
+        out = subprocess.check_output(
+            [ctl, "-d", device, "--list-formats-ext"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3.0,
+        )
+    except Exception:
+        return []
+
+    wanted = pixel_code.strip().upper()
+    in_fmt = False
+    sizes: list[tuple[int, int]] = []
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        m_fmt = re.search(r"\[\d+\]:\s*'([^']+)'", line)
+        if m_fmt:
+            in_fmt = (m_fmt.group(1).strip().upper() == wanted)
+            continue
+        if not in_fmt:
+            continue
+        m_size = re.search(r"Size:\s*Discrete\s*(\d+)x(\d+)", line)
+        if not m_size:
+            continue
+        size = (int(m_size.group(1)), int(m_size.group(2)))
+        if size not in sizes:
+            sizes.append(size)
+    return sizes
+
+
 def _pixel_mode(pixel_arg: str) -> tuple[str, str, str, int]:
     p = str(pixel_arg or "").strip().lower()
     if p in ("grey", "gray8", "8", "8bit"):
@@ -473,6 +507,10 @@ def record_gst_raw(
     target_fps: float,
     min_fps: int,
     max_fps: int,
+    crop_top: int = 0,
+    crop_bottom: int = 0,
+    crop_left: int = 0,
+    crop_right: int = 0,
 ) -> tuple[Path, dict[str, float]]:
     gst = shutil.which("gst-launch-1.0")
     if not gst:
@@ -503,8 +541,15 @@ def record_gst_raw(
     for val in (120, 119, 100, 90, 60, 30):
         add_fps(val)
 
+    out_width = int(width) - int(crop_left) - int(crop_right)
+    out_height = int(height) - int(crop_top) - int(crop_bottom)
+    if out_width <= 0 or out_height <= 0:
+        raise RuntimeError(
+            f"invalid crop: input={int(width)}x{int(height)}, "
+            f"crop l/r/t/b={int(crop_left)}/{int(crop_right)}/{int(crop_top)}/{int(crop_bottom)}"
+        )
     bytes_per_pixel = 2 if str(pixel_code).upper() == "Y16" else 1
-    frame_bytes = max(1, int(width) * int(height) * int(bytes_per_pixel))
+    frame_bytes = max(1, int(out_width) * int(out_height) * int(bytes_per_pixel))
     last_err = "unknown"
     for fps_i in fps_candidates:
         cmd = [
@@ -516,6 +561,19 @@ def record_gst_raw(
             "do-timestamp=true",
             "!",
             f"video/x-raw,format={gst_format},width={int(width)},height={int(height)},framerate={int(fps_i)}/1",
+        ]
+        if int(crop_top) or int(crop_bottom) or int(crop_left) or int(crop_right):
+            cmd += [
+                "!",
+                "videocrop",
+                f"top={int(crop_top)}",
+                f"bottom={int(crop_bottom)}",
+                f"left={int(crop_left)}",
+                f"right={int(crop_right)}",
+                "!",
+                f"video/x-raw,format={gst_format},width={int(out_width)},height={int(out_height)},framerate={int(fps_i)}/1",
+            ]
+        cmd += [
             "!",
             "queue",
             "max-size-buffers=2048",
@@ -625,6 +683,8 @@ def record_gst_raw(
                     "capture_fps_used": float(fps_i),
                     "file_size_bytes": size_b,
                     "frames_from_size": frames_est,
+                    "output_width": float(out_width),
+                    "output_height": float(out_height),
                     "backend_gst_raw": 1.0,
                 }
                 return out_path, stats
@@ -1027,6 +1087,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="", help="Force /dev/videoX (optional)")
     p.add_argument("--width", type=int, default=1024, help="Requested capture width (default: 1024)")
     p.add_argument("--height", type=int, default=768, help="Requested capture height (default: 768)")
+    p.add_argument("--crop-top", type=int, default=0, help="Software crop pixels from top (after capture)")
+    p.add_argument("--crop-bottom", type=int, default=0, help="Software crop pixels from bottom (after capture)")
+    p.add_argument("--crop-left", type=int, default=0, help="Software crop pixels from left (after capture)")
+    p.add_argument("--crop-right", type=int, default=0, help="Software crop pixels from right (after capture)")
     p.add_argument("--roi-x", type=int, default=None, help="ROI offset X (sensor coordinates)")
     p.add_argument("--roi-y", type=int, default=None, help="ROI offset Y (sensor coordinates)")
     p.add_argument(
@@ -1061,6 +1125,7 @@ def main() -> int:
     log(
         f"start: duration={args.duration:.2f}s target_fps={args.target_fps:.1f} "
         f"exposure_us={args.exposure_us:.1f} gain={args.gain:.2f} "
+        f"crop(l/r/t/b)=({int(args.crop_left)}/{int(args.crop_right)}/{int(args.crop_top)}/{int(args.crop_bottom)}) "
         f"roi=({args.roi_x if args.roi_x is not None else '-'},"
         f"{args.roi_y if args.roi_y is not None else '-'}) "
         f"roi_center={args.roi_center} serial_hint={serial_hint or '-'}"
@@ -1091,31 +1156,56 @@ def main() -> int:
                 f"{int(args.width)}x{int(args.height)}"
             )
             return 2
-        log(f"camera selected: dev={dev}, mode={args.width}x{args.height}, pixel={pixel_code}")
+        cap_w = int(args.width)
+        cap_h = int(args.height)
+        out_w = cap_w - int(args.crop_left) - int(args.crop_right)
+        out_h = cap_h - int(args.crop_top) - int(args.crop_bottom)
+        if out_w <= 0 or out_h <= 0:
+            log(
+                f"failed: invalid crop for {cap_w}x{cap_h}: "
+                f"l/r/t/b={int(args.crop_left)}/{int(args.crop_right)}/{int(args.crop_top)}/{int(args.crop_bottom)}"
+            )
+            return 2
+        log(f"camera selected: dev={dev}, mode={cap_w}x{cap_h}, pixel={pixel_code}, out={out_w}x{out_h}")
+        supported_sizes = _v4l2_supported_sizes(dev, pixel_code)
+        supported_fps = _v4l2_supported_fps(dev, cap_w, cap_h, pixel_code)
+        if not supported_fps:
+            log(
+                f"failed: unsupported mode for {pixel_code}: {cap_w}x{cap_h}. "
+                f"Supported sizes: {supported_sizes}"
+            )
+            log(
+                "tip: keep hardware mode 1024x768 and crop in processing, or choose one of supported sizes above"
+            )
+            return 2
         set_roi_v4l2(dev, args.roi_x, args.roi_y, str(args.roi_center))
         set_controls_v4l2(dev, args.exposure_us, args.gain)
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_path = out_dir / f"headless_{ts}_{mode_tag}_{int(args.width)}x{int(args.height)}.raw"
+        out_path = out_dir / f"headless_{ts}_{mode_tag}_{out_w}x{out_h}.raw"
         try:
             saved_path, stats = record_gst_raw(
                 device=dev,
                 out_path=out_path,
                 duration_s=float(args.duration),
-                width=int(args.width),
-                height=int(args.height),
+                width=cap_w,
+                height=cap_h,
                 pixel_code=pixel_code,
                 gst_format=gst_format,
                 target_fps=float(args.target_fps),
                 min_fps=int(args.min_fps),
                 max_fps=int(args.max_fps),
+                crop_top=int(args.crop_top),
+                crop_bottom=int(args.crop_bottom),
+                crop_left=int(args.crop_left),
+                crop_right=int(args.crop_right),
             )
         except Exception as exc:
             log(f"failed: gst-raw backend error: {exc}")
             return 3
         _write_raw_sidecar(
             saved_path,
-            width=int(args.width),
-            height=int(args.height),
+            width=int(stats.get("output_width", out_w)),
+            height=int(stats.get("output_height", out_h)),
             pixel_code=pixel_code,
             gst_format=gst_format,
             bytes_per_pixel=int(bpp),
