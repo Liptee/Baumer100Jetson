@@ -1315,11 +1315,65 @@ class CameraWorker(threading.Thread):
                     candidates.append(dev)
         return candidates
 
-    def _try_open_uvc_capture(self, target_fps: float) -> tuple[object | None, str]:
+    @staticmethod
+    def _configure_uvc_mode(cap, req_w: int, req_h: int, target_fps: float) -> tuple[int, int, float]:
+        assert cv2 is not None
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        except Exception:
+            pass
+        # Prefer MJPG for better USB throughput at high FPS.
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(req_w))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(req_h))
+        cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+        # Warm-up reads after mode switch.
+        for _ in range(4):
+            try:
+                cap.read()
+            except Exception:
+                break
+        got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        got_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        return got_w, got_h, got_fps
+
+    @staticmethod
+    def _measure_uvc_read_fps(cap, sample_s: float = 0.45, max_frames: int = 240) -> tuple[float, int, int]:
+        t0 = time.monotonic()
+        n = 0
+        got_w = 0
+        got_h = 0
+        while (time.monotonic() - t0) < float(sample_s) and n < int(max_frames):
+            ret, frm = cap.read()
+            if not ret or frm is None:
+                continue
+            if hasattr(frm, "shape") and len(frm.shape) >= 2:
+                got_h = int(frm.shape[0])
+                got_w = int(frm.shape[1])
+            n += 1
+        dtm = max(1e-6, time.monotonic() - t0)
+        return float(n / dtm), int(got_w), int(got_h)
+
+    def _try_open_uvc_capture(self, target_fps: float) -> tuple[object | None, str, dict[str, float]]:
         if cv2 is None:
-            return None, ""
+            return None, "", {}
         candidates = self._find_uvc_video_candidates()
         terminal_debug("uvc", f"video candidates: {candidates}")
+        mode_candidates = [
+            (2048, 1536),
+            (1920, 1080),
+            (1600, 1200),
+            (1280, 1024),
+            (1280, 960),
+            (1280, 720),
+            (1024, 768),
+            (800, 600),
+            (640, 480),
+        ]
         for dev in candidates:
             cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
             if not cap.isOpened():
@@ -1328,42 +1382,73 @@ class CameraWorker(threading.Thread):
                 except Exception:
                     pass
                 continue
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-            except Exception:
-                pass
-            # MJPG often reduces USB bandwidth pressure on UVC.
-            try:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            except Exception:
-                pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, float(target_fps))
-            ok = False
-            for _ in range(8):
-                ret, frm = cap.read()
-                if ret and frm is not None and hasattr(frm, "shape") and len(frm.shape) >= 2:
-                    ok = True
+            best: dict[str, float] | None = None
+            best_req: tuple[int, int] | None = None
+            selected: dict[str, float] | None = None
+            selected_req: tuple[int, int] | None = None
+            for req_w, req_h in mode_candidates:
+                got_w, got_h, got_fps = self._configure_uvc_mode(cap, req_w, req_h, target_fps)
+                est_fps, frm_w, frm_h = self._measure_uvc_read_fps(cap, sample_s=0.38, max_frames=220)
+                if frm_w > 0 and frm_h > 0:
+                    got_w, got_h = frm_w, frm_h
+                area = max(0, int(got_w) * int(got_h))
+                terminal_debug(
+                    "uvc",
+                    f"probe {dev}: req={req_w}x{req_h}@{target_fps:.1f}, got={got_w}x{got_h}, fps_prop={got_fps:.1f}, fps_est={est_fps:.1f}",
+                )
+                if area <= 0 or est_fps <= 1.0:
+                    continue
+                info = {
+                    "width": float(got_w),
+                    "height": float(got_h),
+                    "fps_prop": float(got_fps),
+                    "fps_est": float(est_fps),
+                }
+                if best is None:
+                    best = info
+                    best_req = (req_w, req_h)
+                else:
+                    best_area = int(best["width"]) * int(best["height"])
+                    if (est_fps > float(best["fps_est"]) + 2.0) or (
+                        abs(est_fps - float(best["fps_est"])) <= 2.0 and area > best_area
+                    ):
+                        best = info
+                        best_req = (req_w, req_h)
+                # Prefer highest resolution mode that can actually keep target fps.
+                if est_fps >= (float(target_fps) * 0.95):
+                    selected = info
+                    selected_req = (req_w, req_h)
                     break
-            if ok:
-                terminal_debug("uvc", f"opened {dev}: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)} @ {float(cap.get(cv2.CAP_PROP_FPS) or 0.0):.1f}")
-                return cap, dev
+            chosen = selected if selected is not None else best
+            chosen_req = selected_req if selected is not None else best_req
+            if chosen is not None and chosen_req is not None:
+                self._configure_uvc_mode(cap, int(chosen_req[0]), int(chosen_req[1]), target_fps)
+                terminal_debug(
+                    "uvc",
+                    f"opened {dev}: {int(chosen['width'])}x{int(chosen['height'])}, fps_est={float(chosen['fps_est']):.1f}",
+                )
+                return cap, dev, chosen
             try:
                 cap.release()
             except Exception:
                 pass
-        return None, ""
+        return None, "", {}
 
     def _run_uvc_fallback_loop(self, target_fps: float) -> bool:
         if cv2 is None or np is None:
             self._emit("status", "UVC fallback unavailable: OpenCV/NumPy missing")
             return False
-        cap, dev = self._try_open_uvc_capture(target_fps)
+        cap, dev, mode = self._try_open_uvc_capture(target_fps)
         if cap is None:
             self._emit("status", "UVC fallback failed: no readable /dev/video device")
             return False
-        self._emit("status", f"UVC fallback active on {dev}")
+        mw = int(mode.get("width", 0))
+        mh = int(mode.get("height", 0))
+        mfps = float(mode.get("fps_est", 0.0))
+        if mw > 0 and mh > 0:
+            self._emit("status", f"UVC fallback active on {dev}: {mw}x{mh}, est_fps={mfps:.1f}")
+        else:
+            self._emit("status", f"UVC fallback active on {dev}")
         terminal_debug("uvc", f"fallback loop active on {dev}")
         try:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -1378,7 +1463,13 @@ class CameraWorker(threading.Thread):
                     "pixel_format": "BGR8(UVC)",
                     "payload": max(0, w * h * 3),
                     "controls": None,
-                    "runtime": {"fps_requested": float(target_fps), "fps_reported": fps},
+                    "runtime": {
+                        "fps_requested": float(target_fps),
+                        "fps_reported": fps,
+                        "fps_est": float(mode.get("fps_est", 0.0)),
+                        "selected_width": float(mode.get("width", w)),
+                        "selected_height": float(mode.get("height", h)),
+                    },
                 },
             )
             while not self.stop_event.is_set():
@@ -2894,7 +2985,21 @@ class BaumerLiveApp(tk.Tk):
         camera_pf = str(self.camera_info.get("pixel_format", "")).upper()
         prefer_software = ("UVC" in camera_pf)
         if prefer_software:
-            # UVC fallback path: prefer simple writer to avoid GStreamer init stalls.
+            # UVC fallback path: first try Jetson HW encoder for higher sustained FPS.
+            pipeline = (
+                "appsrc is-live=true block=false do-timestamp=true format=time ! "
+                "queue leaky=downstream max-size-buffers=32 ! "
+                f"video/x-raw,format=BGR,width={w},height={h},framerate={int(round(fps))}/1 ! "
+                "videoconvert ! video/x-raw,format=I420 ! "
+                "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+                "nvv4l2h264enc maxperf-enable=1 preset-level=1 control-rate=1 bitrate=20000000 iframeinterval=100 idrinterval=100 insert-sps-pps=true ! "
+                "h264parse ! qtmux ! "
+                f'filesink location="{location}" sync=false'
+            )
+            wr = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, (w, h), True)
+            if wr.isOpened():
+                return wr, "jetson-nvv4l2-uvc"
+            # Software fallback.
             mjpg_path = path.with_suffix(".avi")
             wr = cv2.VideoWriter(str(mjpg_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h), True)
             if wr.isOpened():
