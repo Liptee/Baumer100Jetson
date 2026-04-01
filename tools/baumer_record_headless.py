@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import queue
 import re
@@ -344,6 +345,70 @@ def _v4l2_supported_fps(device: str, width: int, height: int, pixel_code: str = 
     return vals
 
 
+def _pixel_mode(pixel_arg: str) -> tuple[str, str, str, int]:
+    p = str(pixel_arg or "").strip().lower()
+    if p in ("grey", "gray8", "8", "8bit"):
+        return ("GREY", "GRAY8", "gray8", 1)
+    if p in ("y16", "gray16", "gray16le", "16", "16bit"):
+        return ("Y16", "GRAY16_LE", "y16", 2)
+    raise ValueError(f"unsupported pixel format: {pixel_arg}")
+
+
+def _pick_best_fps(supported: list[int], target: float, min_fps: int, max_fps: int) -> int:
+    if not supported:
+        return max(1, int(round(float(target))))
+    in_band = [v for v in supported if int(min_fps) <= int(v) <= int(max_fps)]
+    if in_band:
+        return max(in_band)
+    under_max = [v for v in supported if int(v) <= int(max_fps)]
+    if under_max:
+        return max(under_max)
+    return max(supported)
+
+
+def _select_device_for_mode(candidates: list[str], width: int, height: int, pixel_code: str) -> str | None:
+    for dev in candidates:
+        fps = _v4l2_supported_fps(dev, int(width), int(height), pixel_code)
+        if fps:
+            return dev
+    return candidates[0] if candidates else None
+
+
+def _write_raw_sidecar(
+    raw_path: Path,
+    *,
+    width: int,
+    height: int,
+    pixel_code: str,
+    gst_format: str,
+    bytes_per_pixel: int,
+    fps: int,
+    duration_s: float,
+    device: str,
+) -> None:
+    size = int(raw_path.stat().st_size if raw_path.exists() else 0)
+    frame_bytes = int(width) * int(height) * int(bytes_per_pixel)
+    frames = int(size // frame_bytes) if frame_bytes > 0 else 0
+    meta = {
+        "path": str(raw_path),
+        "device": str(device),
+        "width": int(width),
+        "height": int(height),
+        "pixel_code_v4l2": str(pixel_code),
+        "pixel_format_gst": str(gst_format),
+        "bytes_per_pixel": int(bytes_per_pixel),
+        "requested_fps": int(fps),
+        "duration_s": float(duration_s),
+        "file_size_bytes": int(size),
+        "frame_bytes": int(frame_bytes),
+        "frames_from_size": int(frames),
+        "fps_from_size": float(frames / max(1e-6, float(duration_s))),
+    }
+    sidecar = raw_path.with_suffix(raw_path.suffix + ".json")
+    sidecar.write_text(json.dumps(meta, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    log(f"sidecar saved: {sidecar}")
+
+
 def _stream_subprocess_output(prefix: str, pipe) -> None:
     try:
         for line in iter(pipe.readline, ""):
@@ -352,6 +417,159 @@ def _stream_subprocess_output(prefix: str, pipe) -> None:
                 log(f"{prefix}{text}")
     except Exception:
         pass
+
+
+def record_gst_raw(
+    *,
+    device: str,
+    out_path: Path,
+    duration_s: float,
+    width: int,
+    height: int,
+    pixel_code: str,
+    gst_format: str,
+    target_fps: float,
+    min_fps: int,
+    max_fps: int,
+) -> tuple[Path, dict[str, float]]:
+    gst = shutil.which("gst-launch-1.0")
+    if not gst:
+        raise RuntimeError("gst-launch-1.0 not found")
+
+    supported = _v4l2_supported_fps(device, int(width), int(height), pixel_code)
+    if supported:
+        log(f"v4l2 supported fps for {pixel_code} {width}x{height}: {supported}")
+    fps_best = _pick_best_fps(supported, float(target_fps), int(min_fps), int(max_fps))
+
+    fps_candidates: list[int] = []
+
+    def add_fps(v: int) -> None:
+        iv = int(v)
+        if iv > 0 and iv not in fps_candidates:
+            fps_candidates.append(iv)
+
+    add_fps(fps_best)
+    for val in supported:
+        if int(min_fps) <= int(val) <= int(max_fps):
+            add_fps(int(val))
+    for val in supported:
+        if int(val) <= int(max_fps):
+            add_fps(int(val))
+    for val in supported:
+        add_fps(int(val))
+    add_fps(int(round(float(target_fps))))
+    for val in (120, 119, 100, 90, 60, 30):
+        add_fps(val)
+
+    last_err = "unknown"
+    for fps_i in fps_candidates:
+        cmd = [
+            gst,
+            "-e",
+            "v4l2src",
+            f"device={device}",
+            "io-mode=2",
+            "do-timestamp=true",
+            "!",
+            f"video/x-raw,format={gst_format},width={int(width)},height={int(height)},framerate={int(fps_i)}/1",
+            "!",
+            "queue",
+            "max-size-buffers=2048",
+            "leaky=downstream",
+            "!",
+            "filesink",
+            f"location={str(out_path)}",
+            "sync=false",
+        ]
+        log(f"gst raw start (fps={fps_i}): {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        reader = None
+        if proc.stdout is not None:
+            reader = threading.Thread(
+                target=_stream_subprocess_output,
+                args=("[gst] ", proc.stdout),
+                name="gst-log",
+                daemon=True,
+            )
+            reader.start()
+
+        t0 = time.monotonic()
+        ok = True
+        last_log = 0.0
+        while True:
+            elapsed = time.monotonic() - t0
+            if elapsed >= float(duration_s):
+                break
+            rc = proc.poll()
+            if rc is not None:
+                ok = False
+                last_err = f"gst exited early with code {rc} at fps={fps_i}"
+                break
+            if elapsed - last_log >= 1.0:
+                last_log = elapsed
+                size_mb = 0.0
+                try:
+                    size_mb = out_path.stat().st_size / (1024.0 * 1024.0)
+                except Exception:
+                    pass
+                log(f"gst raw telemetry: elapsed={elapsed:.1f}s size={size_mb:.1f}MB")
+            time.sleep(0.05)
+
+        if ok:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+            try:
+                rc = proc.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                rc = proc.wait(timeout=3.0)
+            if reader is not None:
+                reader.join(timeout=1.0)
+            if rc in (0, 130):
+                elapsed_total = max(1e-6, time.monotonic() - t0)
+                size_b = float(out_path.stat().st_size if out_path.exists() else 0)
+                stats = {
+                    "elapsed_s": elapsed_total,
+                    "read": 0.0,
+                    "enq": 0.0,
+                    "written": 0.0,
+                    "q_drop": 0.0,
+                    "read_fail": 0.0,
+                    "write_fail": 0.0,
+                    "read_fps_avg": float(fps_i),
+                    "write_fps_avg": float(fps_i),
+                    "capture_fps_used": float(fps_i),
+                    "file_size_bytes": size_b,
+                    "backend_gst_raw": 1.0,
+                }
+                return out_path, stats
+            last_err = f"gst failed with code {rc} at fps={fps_i}"
+        else:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            if reader is not None:
+                reader.join(timeout=1.0)
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            time.sleep(0.15)
+
+    raise RuntimeError(last_err)
 
 
 def record_gst_mjpeg(
@@ -717,20 +935,28 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Headless UVC recorder for Jetson/TIS camera")
     p.add_argument("--duration", type=float, default=5.0, help="Recording duration in seconds")
     p.add_argument("--target-fps", type=float, default=100.0, help="Target FPS")
+    p.add_argument("--min-fps", type=int, default=100, help="Minimal acceptable FPS for auto-pick")
+    p.add_argument("--max-fps", type=int, default=120, help="Maximal acceptable FPS for auto-pick")
     p.add_argument("--exposure-us", type=float, default=9500.0, help="Exposure in microseconds")
     p.add_argument("--gain", type=float, default=1.0, help="Gain value")
     p.add_argument("--camera-id", default="", help="Camera id/serial hint (optional)")
     p.add_argument("--device", default="", help="Force /dev/videoX (optional)")
-    p.add_argument("--width", type=int, default=640, help="Requested capture width (default: 640)")
-    p.add_argument("--height", type=int, default=480, help="Requested capture height (default: 480)")
+    p.add_argument("--width", type=int, default=1024, help="Requested capture width (default: 1024)")
+    p.add_argument("--height", type=int, default=768, help="Requested capture height (default: 768)")
+    p.add_argument(
+        "--pixel-format",
+        choices=["gray8", "y16"],
+        default="gray8",
+        help="Capture pixel format: gray8 or y16",
+    )
     p.add_argument("--auto-mode", action="store_true", help="Probe multiple camera modes and auto-select one")
     p.add_argument("--snapshot-dir", default="capture", help="Output directory")
     p.add_argument("--queue-size", type=int, default=512, help="Frame queue size")
     p.add_argument(
         "--backend",
-        choices=["auto", "gst-mjpeg", "opencv"],
+        choices=["auto", "gst-raw", "gst-mjpeg", "opencv"],
         default="auto",
-        help="Recording backend: auto (prefer gst raw/h264 path), gst-mjpeg, opencv",
+        help="Recording backend: auto (prefer gst-raw), gst-raw (recommended), opencv",
     )
     return p.parse_args()
 
@@ -744,6 +970,74 @@ def main() -> int:
         f"start: duration={args.duration:.2f}s target_fps={args.target_fps:.1f} "
         f"exposure_us={args.exposure_us:.1f} gain={args.gain:.2f} serial_hint={serial_hint or '-'}"
     )
+
+    backend = str(args.backend)
+    if backend == "auto":
+        backend = "gst-raw" if shutil.which("gst-launch-1.0") else "opencv"
+    if backend == "gst-mjpeg":
+        backend = "gst-raw"
+    log(f"record backend: {backend}")
+
+    # Fast path: raw GStreamer capture, preserves 8/16-bit.
+    if backend == "gst-raw":
+        try:
+            pixel_code, gst_format, mode_tag, bpp = _pixel_mode(args.pixel_format)
+        except Exception as exc:
+            log(f"failed: {exc}")
+            return 2
+        candidates = [str(args.device)] if str(args.device) else find_uvc_candidates(serial_hint)
+        if not candidates:
+            log("failed: no /dev/video* camera candidates found")
+            return 2
+        dev = _select_device_for_mode(candidates, int(args.width), int(args.height), pixel_code)
+        if not dev:
+            log(
+                f"failed: no camera supports {pixel_code} at "
+                f"{int(args.width)}x{int(args.height)}"
+            )
+            return 2
+        log(f"camera selected: dev={dev}, mode={args.width}x{args.height}, pixel={pixel_code}")
+        set_controls_v4l2(dev, args.exposure_us, args.gain)
+        ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_path = out_dir / f"headless_{ts}_{mode_tag}_{int(args.width)}x{int(args.height)}.raw"
+        try:
+            saved_path, stats = record_gst_raw(
+                device=dev,
+                out_path=out_path,
+                duration_s=float(args.duration),
+                width=int(args.width),
+                height=int(args.height),
+                pixel_code=pixel_code,
+                gst_format=gst_format,
+                target_fps=float(args.target_fps),
+                min_fps=int(args.min_fps),
+                max_fps=int(args.max_fps),
+            )
+        except Exception as exc:
+            log(f"failed: gst-raw backend error: {exc}")
+            return 3
+        _write_raw_sidecar(
+            saved_path,
+            width=int(args.width),
+            height=int(args.height),
+            pixel_code=pixel_code,
+            gst_format=gst_format,
+            bytes_per_pixel=int(bpp),
+            fps=int(round(float(stats.get("capture_fps_used", 0.0) or 0.0))),
+            duration_s=float(args.duration),
+            device=dev,
+        )
+        log(
+            "done: "
+            f"file={saved_path} pixel={pixel_code} "
+            f"capture_fps_used={stats.get('capture_fps_used', 0.0):.1f} "
+            f"size_mb={(float(stats.get('file_size_bytes', 0.0)) / (1024.0 * 1024.0)):.1f}"
+        )
+        return 0
+
+    # Compatibility path: OpenCV capture/record.
+    if str(args.pixel_format).lower() == "y16":
+        log("warn: opencv backend does not guarantee native Y16 preservation; use --backend gst-raw")
 
     opened = try_open_uvc(
         args.target_fps,
@@ -760,79 +1054,27 @@ def main() -> int:
     w = int(opened["w"])
     h = int(opened["h"])
     fps_est = float(opened["fps_est"])
-    fps_prop = float(opened.get("fps_prop", 0.0) or 0.0)
     log(f"camera connected: dev={dev}, mode={w}x{h}, est_fps={fps_est:.1f}")
-    fps_disc = _v4l2_supported_fps(dev, w, h, "GREY")
-    if fps_disc:
-        log(f"v4l2 GREY discrete fps for {w}x{h}: {fps_disc}")
 
     # Apply controls (best-effort).
     set_controls_v4l2(dev, args.exposure_us, args.gain)
     set_controls_cv2(cap, args.exposure_us, args.gain)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backend = str(args.backend)
-    if backend == "auto":
-        backend = "gst-mjpeg" if shutil.which("gst-launch-1.0") else "opencv"
-    log(f"record backend: {backend}")
-
-    saved_path: Path
-    stats: dict[str, float]
-    if backend == "gst-mjpeg":
+    out_path = out_dir / f"headless_{ts}.mp4"
+    try:
+        saved_path, stats = record_headless(
+            cap=cap,
+            out_path=out_path,
+            duration_s=float(args.duration),
+            target_fps=float(args.target_fps),
+            queue_size=int(args.queue_size),
+        )
+    finally:
         try:
             cap.release()
         except Exception:
             pass
-        out_path = out_dir / f"headless_{ts}.mkv"
-        try:
-            saved_path, stats = record_gst_mjpeg(
-                device=dev,
-                out_path=out_path,
-                duration_s=float(args.duration),
-                fps=float(args.target_fps),
-                width=w,
-                height=h,
-                fps_hint=(fps_prop if fps_prop > 0 else fps_est),
-            )
-        except Exception as exc:
-            if str(args.backend) == "gst-mjpeg":
-                log(f"failed: gst-mjpeg backend error: {exc}")
-                return 3
-            log(f"gst-mjpeg failed ({exc}), fallback to opencv backend")
-            cap = require_cv2().VideoCapture(dev, require_cv2().CAP_V4L2)
-            if not cap.isOpened():
-                log("failed: cannot reopen camera for opencv fallback")
-                return 4
-            configure_uvc_mode(cap, w, h, float(args.target_fps))
-            out_path = out_dir / f"headless_{ts}.mp4"
-            try:
-                saved_path, stats = record_headless(
-                    cap=cap,
-                    out_path=out_path,
-                    duration_s=float(args.duration),
-                    target_fps=float(args.target_fps),
-                    queue_size=int(args.queue_size),
-                )
-            finally:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-    else:
-        out_path = out_dir / f"headless_{ts}.mp4"
-        try:
-            saved_path, stats = record_headless(
-                cap=cap,
-                out_path=out_path,
-                duration_s=float(args.duration),
-                target_fps=float(args.target_fps),
-                queue_size=int(args.queue_size),
-            )
-        finally:
-            try:
-                cap.release()
-            except Exception:
-                pass
 
     log(
         "done: "
