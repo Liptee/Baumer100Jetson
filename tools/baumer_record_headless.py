@@ -461,6 +461,8 @@ def record_gst_raw(
     for val in (120, 119, 100, 90, 60, 30):
         add_fps(val)
 
+    bytes_per_pixel = 2 if str(pixel_code).upper() == "Y16" else 1
+    frame_bytes = max(1, int(width) * int(height) * int(bytes_per_pixel))
     last_err = "unknown"
     for fps_i in fps_candidates:
         cmd = [
@@ -533,9 +535,23 @@ def record_gst_raw(
                 rc = proc.wait(timeout=3.0)
             if reader is not None:
                 reader.join(timeout=1.0)
-            if rc in (0, 130):
-                elapsed_total = max(1e-6, time.monotonic() - t0)
-                size_b = float(out_path.stat().st_size if out_path.exists() else 0)
+            elapsed_total = max(1e-6, time.monotonic() - t0)
+            size_b = float(out_path.stat().st_size if out_path.exists() else 0)
+            frames_est = float(size_b / float(frame_bytes))
+            fps_est = float(frames_est / elapsed_total)
+            # On some Jetson builds gst-launch may return non-zero on interrupt
+            # even after valid EOS/write. Accept by data/elapsed evidence.
+            good_by_data = (
+                elapsed_total >= float(duration_s) * 0.85
+                and fps_est >= max(1.0, float(min_fps) * 0.50)
+                and size_b >= float(frame_bytes) * max(1.0, float(min_fps) * float(duration_s) * 0.30)
+            )
+            if rc in (0, 130) or good_by_data:
+                if rc not in (0, 130):
+                    log(
+                        "gst raw accepted by data despite non-zero rc: "
+                        f"rc={rc}, elapsed={elapsed_total:.3f}s, fps_est={fps_est:.1f}"
+                    )
                 stats = {
                     "elapsed_s": elapsed_total,
                     "read": 0.0,
@@ -548,10 +564,18 @@ def record_gst_raw(
                     "write_fps_avg": float(fps_i),
                     "capture_fps_used": float(fps_i),
                     "file_size_bytes": size_b,
+                    "frames_from_size": frames_est,
                     "backend_gst_raw": 1.0,
                 }
                 return out_path, stats
-            last_err = f"gst failed with code {rc} at fps={fps_i}"
+            last_err = (
+                f"gst failed with code {rc} at fps={fps_i}; "
+                f"elapsed={elapsed_total:.3f}s fps_est={fps_est:.1f}"
+            )
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         else:
             try:
                 proc.terminate()
