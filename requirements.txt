@@ -1,4 +1,3 @@
-numpy>=1.26
-Pillow>=10.0
-scipy>=1.12
+# Optional dependency.
+# Needed only for --backend opencv path in tools/baumer_record_headless.py.
 opencv-python>=4.10
