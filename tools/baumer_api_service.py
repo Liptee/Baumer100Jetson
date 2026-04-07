@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import re
+import signal
 import subprocess
 import threading
 import uuid
@@ -308,15 +309,19 @@ def api_record_stop() -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="No active record job")
 
     try:
-        proc.terminate()
+        # Graceful stop first: recorder handles SIGINT and finalizes sidecar json.
+        proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=5.0)
+            proc.wait(timeout=8.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=3.0)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to stop record job: {exc}")
 
     _append_log(f"[job={cur.get('job_id') if cur else '-'}] stop requested")
     return {"stopped": True, "job_id": cur.get("job_id") if cur else None}
-

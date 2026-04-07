@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 cv2 = None
+STOP_REQUESTED = threading.Event()
 
 
 def require_cv2():
@@ -33,6 +34,21 @@ def log(msg: str) -> None:
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     tn = threading.current_thread().name
     print(f"[{ts}] [{tn}] {msg}", flush=True)
+
+
+def _handle_stop_signal(signum, _frame) -> None:
+    STOP_REQUESTED.set()
+    try:
+        log(f"signal received: {signum}, stopping gracefully...")
+    except Exception:
+        pass
+
+
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    try:
+        signal.signal(_sig, _handle_stop_signal)
+    except Exception:
+        pass
 
 
 def extract_serial_hint(text: str) -> str:
@@ -603,9 +619,13 @@ def record_gst_raw(
 
         t0 = time.monotonic()
         ok = True
+        interrupted = False
         last_log = 0.0
         while True:
             elapsed = time.monotonic() - t0
+            if STOP_REQUESTED.is_set():
+                interrupted = True
+                break
             if elapsed >= float(duration_s):
                 break
             rc = proc.poll()
@@ -659,17 +679,22 @@ def record_gst_raw(
             fps_est = float(frames_est / elapsed_total)
             # On some Jetson builds gst-launch may return non-zero on interrupt
             # even after valid EOS/write. Accept by data/elapsed evidence.
-            good_by_data = (
-                elapsed_total >= float(duration_s) * 0.85
-                and fps_est >= max(1.0, float(min_fps) * 0.50)
-                and size_b >= float(frame_bytes) * max(1.0, float(min_fps) * float(duration_s) * 0.30)
-            )
+            if interrupted:
+                good_by_data = size_b >= float(frame_bytes)
+            else:
+                good_by_data = (
+                    elapsed_total >= float(duration_s) * 0.85
+                    and fps_est >= max(1.0, float(min_fps) * 0.50)
+                    and size_b >= float(frame_bytes) * max(1.0, float(min_fps) * float(duration_s) * 0.30)
+                )
             if rc in (0, 130) or good_by_data:
                 if rc not in (0, 130):
                     log(
                         "gst raw accepted by data despite non-zero rc: "
                         f"rc={rc}, elapsed={elapsed_total:.3f}s, fps_est={fps_est:.1f}"
                     )
+                if interrupted:
+                    log("gst raw accepted after stop request")
                 stats = {
                     "elapsed_s": elapsed_total,
                     "read": 0.0,
@@ -685,6 +710,7 @@ def record_gst_raw(
                     "frames_from_size": frames_est,
                     "output_width": float(out_width),
                     "output_height": float(out_height),
+                    "interrupted": 1.0 if interrupted else 0.0,
                     "backend_gst_raw": 1.0,
                 }
                 return out_path, stats
@@ -1118,6 +1144,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    STOP_REQUESTED.clear()
     args = parse_args()
     out_dir = Path(args.snapshot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1210,7 +1237,7 @@ def main() -> int:
             gst_format=gst_format,
             bytes_per_pixel=int(bpp),
             fps=int(round(float(stats.get("capture_fps_used", 0.0) or 0.0))),
-            duration_s=float(args.duration),
+            duration_s=float(stats.get("elapsed_s", args.duration)),
             device=dev,
         )
         log(
