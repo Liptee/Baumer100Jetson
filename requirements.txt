@@ -1,3 +1,7 @@
 # Optional dependency.
 # Needed only for --backend opencv path in tools/baumer_record_headless.py.
 opencv-python>=4.10
+
+# API service
+fastapi>=0.110
+uvicorn>=0.29

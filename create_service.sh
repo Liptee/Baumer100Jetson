@@ -20,6 +20,8 @@ if [[ ! -f "$ENV_PATH" ]]; then
   sudo tee "$ENV_PATH" >/dev/null <<EOF
 # ${SERVICE_NAME} runtime settings
 PYTHON_BIN=${REPO_DIR}/.venv/bin/python
+API_HOST=0.0.0.0
+API_PORT=8000
 BACKEND=gst-raw
 PIXEL_FORMAT=gray8
 WIDTH=1024
@@ -40,14 +42,12 @@ CROP_RIGHT=0
 CAMERA_ID=
 DEVICE=
 SNAPSHOT_DIR=${REPO_DIR}/capture
-LOOP_RECORDING=1
-LOOP_DELAY_SEC=1
 EOF
 fi
 
 sudo tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
-Description=Baumer Headless Recorder Service
+Description=Baumer FastAPI Recorder Service
 After=network-online.target
 Wants=network-online.target
 
@@ -74,4 +74,3 @@ sudo systemctl restart "${SERVICE_NAME}.service"
 echo "Service installed: ${SERVICE_NAME}.service"
 echo "Edit config: ${ENV_PATH}"
 echo "Logs: sudo journalctl -u ${SERVICE_NAME}.service -f"
-

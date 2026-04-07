@@ -1,14 +1,13 @@
-# Baumer USB Recorder (Headless)
+# Baumer USB Recorder + FastAPI Service
 
-Минимальный проект для записи RAW-видео с USB-камеры без GUI.
+Проект для записи RAW-видео с USB-камеры (GRAY8/Y16) и управления записью через FastAPI.
 
-Основной скрипт:
-- `tools/baumer_record_headless.py`
+## Что внутри
 
-Сервисный обвес:
-- `run_baumer_service.sh`
-- `create_service.sh`
-- `example_update_and_restart_service.sh`
+- `tools/baumer_record_headless.py` — запись RAW из CLI
+- `tools/baumer_api_service.py` — FastAPI API (`start/status/stop/logs`)
+- `run_baumer_service.sh` — запуск API-сервиса (uvicorn)
+- `create_service.sh` — установка systemd unit
 
 ## Установка (Raspberry Pi OS / Ubuntu)
 
@@ -17,10 +16,10 @@ sudo apt update
 sudo apt install -y python3 python3-venv python3-pip v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-good ffmpeg
 ```
 
-Создать venv:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Проверка камеры
@@ -30,9 +29,8 @@ v4l2-ctl --list-devices
 v4l2-ctl -d /dev/video0 --list-formats-ext
 ```
 
-## Ручной запуск
+## Ручная запись (CLI)
 
-### 8-bit (GRAY8), 1024x768
 ```bash
 python tools/baumer_record_headless.py \
   --backend gst-raw \
@@ -42,76 +40,66 @@ python tools/baumer_record_headless.py \
   --duration 5 --exposure-us 9500 --gain 1
 ```
 
-### 16-bit (Y16), 1024x768
+## FastAPI локально
+
 ```bash
-python tools/baumer_record_headless.py \
-  --backend gst-raw \
-  --pixel-format y16 \
-  --width 1024 --height 768 \
-  --target-fps 100 --min-fps 100 --max-fps 120 \
-  --duration 5 --exposure-us 9500 --gain 1
+source .venv/bin/activate
+python -m uvicorn baumer_api_service:app --app-dir tools --host 0.0.0.0 --port 8000
 ```
 
-### Обрезка (software crop) сверху/снизу
-Пример: `1024x768 -> 1024x568`.
+Проверка:
 ```bash
-python tools/baumer_record_headless.py \
-  --backend gst-raw \
-  --pixel-format gray8 \
-  --width 1024 --height 768 \
-  --crop-top 100 --crop-bottom 100 \
-  --target-fps 120 --min-fps 120 --max-fps 120 \
-  --duration 10 --exposure-us 9500 --gain 1
+curl http://127.0.0.1:8000/api/health
 ```
 
-### ROI (hardware, через V4L2 controls)
+### API: запуск записи
+
 ```bash
-python tools/baumer_record_headless.py \
-  --backend gst-raw \
-  --pixel-format gray8 \
-  --width 1024 --height 768 \
-  --roi-center off --roi-x 512 --roi-y 384 \
-  --target-fps 120 --min-fps 100 --max-fps 120 \
-  --duration 10 --exposure-us 9500 --gain 1
+curl -X POST "http://127.0.0.1:8000/api/record/start" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "backend": "gst-raw",
+    "pixel_format": "gray8",
+    "width": 1024,
+    "height": 768,
+    "target_fps": 120,
+    "min_fps": 100,
+    "max_fps": 120,
+    "duration": 10,
+    "exposure_us": 9500,
+    "gain": 1,
+    "roi_center": "off",
+    "roi_x": 512,
+    "roi_y": 384,
+    "crop_top": 100,
+    "crop_bottom": 100
+  }'
 ```
 
-## Формат выхода
+### API: статус / логи / остановка
 
-В `capture/` создаются:
-- `*.raw` — сырые кадры подряд
-- `*.raw.json` — метаданные (размер, fps, bytes_per_pixel, расчетное число кадров)
-
-## Просмотр `.raw`
-
-Пример для `GRAY8`, `1024x768`, `100.8 fps`:
 ```bash
-ffplay -f rawvideo -pixel_format gray -video_size 1024x768 -framerate 100.8 capture/file.raw
+curl "http://127.0.0.1:8000/api/record/status"
+curl "http://127.0.0.1:8000/api/record/logs?tail=200"
+curl -X POST "http://127.0.0.1:8000/api/record/stop"
 ```
 
-## Установка как systemd-сервис
+## Установка как systemd service
 
-1. Сделать скрипты исполняемыми:
 ```bash
-chmod +x create_service.sh run_baumer_service.sh example_update_and_restart_service.sh
-```
-
-2. Установить и запустить сервис:
-```bash
+chmod +x create_service.sh run_baumer_service.sh
 ./create_service.sh
 ```
 
-3. Настройки сервиса:
+Настройки:
 ```bash
 sudo nano /etc/default/baumer_recorder
 ```
 
-4. Перезапуск:
+Управление:
 ```bash
 sudo systemctl restart baumer_recorder.service
-```
-
-5. Логи:
-```bash
+sudo systemctl status baumer_recorder.service
 sudo journalctl -u baumer_recorder.service -f
 ```
 
