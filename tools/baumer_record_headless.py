@@ -501,6 +501,123 @@ def _write_raw_sidecar(
     log(f"sidecar saved: {sidecar}")
 
 
+def _iso_utc_from_unix_ns(unix_ns: int) -> str:
+    return (
+        dt.datetime.fromtimestamp(float(unix_ns) / 1_000_000_000.0, tz=dt.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _write_timestamps_sidecar(
+    raw_path: Path,
+    *,
+    start_unix_ns: int,
+    end_unix_ns: int,
+    start_mono_ns: int,
+    end_mono_ns: int,
+    frame_count: int,
+    frame_bytes: int,
+    capture_fps_used: float,
+    progress_samples: list[tuple[int, int]] | list[list[int]] | None,
+) -> None:
+    frame_count = max(0, int(frame_count))
+    frame_bytes = max(1, int(frame_bytes))
+    start_unix_ns = int(start_unix_ns)
+    end_unix_ns = int(end_unix_ns)
+    start_mono_ns = int(start_mono_ns)
+    end_mono_ns = int(end_mono_ns)
+
+    # Normalize samples: (mono_ns, size_bytes)
+    samples_raw = progress_samples or []
+    seq: list[tuple[int, float]] = []
+    for it in samples_raw:
+        try:
+            mono_ns = int(it[0])
+            size_b = int(it[1])
+        except Exception:
+            continue
+        if mono_ns <= 0:
+            continue
+        frames_f = float(size_b) / float(frame_bytes)
+        if frames_f < 0.0:
+            frames_f = 0.0
+        seq.append((mono_ns, frames_f))
+    if not seq:
+        seq = [(start_mono_ns, 0.0), (end_mono_ns, float(frame_count))]
+    else:
+        seq.sort(key=lambda x: x[0])
+        if seq[0][0] > start_mono_ns:
+            seq.insert(0, (start_mono_ns, 0.0))
+        if seq[-1][0] < end_mono_ns:
+            seq.append((end_mono_ns, float(frame_count)))
+
+    # Enforce non-decreasing frame progression.
+    fixed: list[tuple[int, float]] = []
+    prev_f = 0.0
+    prev_t = -1
+    for mono_ns, frames_f in seq:
+        if mono_ns <= prev_t:
+            continue
+        if frames_f < prev_f:
+            frames_f = prev_f
+        fixed.append((mono_ns, frames_f))
+        prev_t = mono_ns
+        prev_f = frames_f
+    if len(fixed) < 2:
+        fixed = [(start_mono_ns, 0.0), (end_mono_ns, float(frame_count))]
+
+    csv_path = raw_path.with_suffix(raw_path.suffix + ".timestamps.csv")
+    meta_path = raw_path.with_suffix(raw_path.suffix + ".timestamps.json")
+
+    # Write per-frame timestamps via piecewise linear interpolation on (mono, written_frames).
+    with csv_path.open("w", encoding="utf-8") as fh:
+        fh.write("frame_idx,mono_ns,unix_ns,utc_iso\n")
+        j = 0
+        n = len(fixed)
+        for idx in range(frame_count):
+            target = float(idx + 1)
+            while (j + 1) < n and fixed[j + 1][1] < target:
+                j += 1
+            if (j + 1) >= n:
+                mono_ns = fixed[-1][0]
+            else:
+                t0, f0 = fixed[j]
+                t1, f1 = fixed[j + 1]
+                if f1 <= f0:
+                    mono_ns = t1
+                else:
+                    a = (target - f0) / (f1 - f0)
+                    if a < 0.0:
+                        a = 0.0
+                    elif a > 1.0:
+                        a = 1.0
+                    mono_ns = int(round(float(t0) + a * float(t1 - t0)))
+            unix_ns = start_unix_ns + int(mono_ns - start_mono_ns)
+            fh.write(f"{idx},{mono_ns},{unix_ns},{_iso_utc_from_unix_ns(unix_ns)}\n")
+
+    meta = {
+        "path_raw": str(raw_path),
+        "path_timestamps_csv": str(csv_path),
+        "frame_count": int(frame_count),
+        "frame_bytes": int(frame_bytes),
+        "capture_fps_used": float(capture_fps_used),
+        "time_base": {
+            "start_unix_ns": int(start_unix_ns),
+            "end_unix_ns": int(end_unix_ns),
+            "start_mono_ns": int(start_mono_ns),
+            "end_mono_ns": int(end_mono_ns),
+            "start_utc": _iso_utc_from_unix_ns(start_unix_ns),
+            "end_utc": _iso_utc_from_unix_ns(end_unix_ns),
+        },
+        "model": "piecewise_linear_interpolation_from_progress_samples",
+        "progress_sample_count": int(len(fixed)),
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    log(f"timestamps saved: {csv_path}")
+    log(f"timestamps meta saved: {meta_path}")
+
+
 def _stream_subprocess_output(prefix: str, pipe) -> None:
     try:
         for line in iter(pipe.readline, ""):
@@ -568,6 +685,9 @@ def record_gst_raw(
     frame_bytes = max(1, int(out_width) * int(out_height) * int(bytes_per_pixel))
     last_err = "unknown"
     for fps_i in fps_candidates:
+        attempt_start_unix_ns = time.time_ns()
+        attempt_start_mono_ns = time.monotonic_ns()
+        progress_samples: list[tuple[int, int]] = [(attempt_start_mono_ns, 0)]
         cmd = [
             gst,
             "-e",
@@ -623,6 +743,15 @@ def record_gst_raw(
         last_log = 0.0
         while True:
             elapsed = time.monotonic() - t0
+            mono_now_ns = time.monotonic_ns()
+            try:
+                size_now_b = int(out_path.stat().st_size)
+            except Exception:
+                size_now_b = 0
+            if not progress_samples or size_now_b != progress_samples[-1][1] or (
+                mono_now_ns - progress_samples[-1][0]
+            ) >= 200_000_000:
+                progress_samples.append((mono_now_ns, size_now_b))
             if STOP_REQUESTED.is_set():
                 interrupted = True
                 break
@@ -674,7 +803,11 @@ def record_gst_raw(
             if reader is not None:
                 reader.join(timeout=1.0)
             elapsed_total = max(1e-6, time.monotonic() - t0)
+            attempt_end_unix_ns = time.time_ns()
+            attempt_end_mono_ns = time.monotonic_ns()
             size_b = float(out_path.stat().st_size if out_path.exists() else 0)
+            if not progress_samples or int(size_b) != progress_samples[-1][1]:
+                progress_samples.append((attempt_end_mono_ns, int(size_b)))
             frames_est = float(size_b / float(frame_bytes))
             fps_est = float(frames_est / elapsed_total)
             # On some Jetson builds gst-launch may return non-zero on interrupt
@@ -710,6 +843,12 @@ def record_gst_raw(
                     "frames_from_size": frames_est,
                     "output_width": float(out_width),
                     "output_height": float(out_height),
+                    "start_unix_ns": float(attempt_start_unix_ns),
+                    "end_unix_ns": float(attempt_end_unix_ns),
+                    "start_mono_ns": float(attempt_start_mono_ns),
+                    "end_mono_ns": float(attempt_end_mono_ns),
+                    "frame_bytes": float(frame_bytes),
+                    "progress_samples": [[int(t), int(b)] for t, b in progress_samples],
                     "interrupted": 1.0 if interrupted else 0.0,
                     "backend_gst_raw": 1.0,
                 }
@@ -1239,6 +1378,17 @@ def main() -> int:
             fps=int(round(float(stats.get("capture_fps_used", 0.0) or 0.0))),
             duration_s=float(stats.get("elapsed_s", args.duration)),
             device=dev,
+        )
+        _write_timestamps_sidecar(
+            saved_path,
+            start_unix_ns=int(stats.get("start_unix_ns", time.time_ns())),
+            end_unix_ns=int(stats.get("end_unix_ns", time.time_ns())),
+            start_mono_ns=int(stats.get("start_mono_ns", time.monotonic_ns())),
+            end_mono_ns=int(stats.get("end_mono_ns", time.monotonic_ns())),
+            frame_count=int(stats.get("frames_from_size", 0)),
+            frame_bytes=int(stats.get("frame_bytes", int(out_w) * int(out_h) * int(bpp))),
+            capture_fps_used=float(stats.get("capture_fps_used", 0.0)),
+            progress_samples=stats.get("progress_samples"),
         )
         log(
             "done: "
