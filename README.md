@@ -38,6 +38,19 @@ v4l2-ctl -d /dev/video0 --list-formats-ext
 
 ## Ручной запуск (CLI)
 
+### Запуск через bash-обертку (record + decode)
+
+```bash
+tools/record_and_decode.sh \
+  --bitness gray8 \
+  --roi-center off --roi-x 512 --roi-y 384 \
+  --crop-top 100 --crop-bottom 100 \
+  --duration 10
+```
+
+Скрипт запускает `tools/baumer_record_headless.py`, затем автоматически декодирует свежий `.raw` в `.mp4` через `ffmpeg`.
+Для `--bitness y16` выходной файл создается как 16-битный lossless `*.mkv` (codec `ffv1`, `gray16le`).
+
 ### GRAY8, 1024x768
 
 ```bash
