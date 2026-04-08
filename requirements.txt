@@ -5,3 +5,7 @@ opencv-python>=4.10
 # API service
 fastapi>=0.110
 uvicorn>=0.29
+
+# Optional dependency.
+# Needed only for telemetry capture (--telemetry-enable).
+pymavlink>=2.4.41

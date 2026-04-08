@@ -1,6 +1,7 @@
 # Baumer USB Recorder + FastAPI
 
 Headless-проект для записи RAW-видео с USB-камеры (режимы `GRAY8` и `Y16`) и управления записью через FastAPI.
+Также поддерживается параллельная запись MAVLink-телеметрии с полетного контроллера по USB/UART.
 
 ## Файлы
 
@@ -46,6 +47,22 @@ python tools/baumer_record_headless.py \
   --target-fps 120 --min-fps 100 --max-fps 120 \
   --duration 10 --exposure-us 9500 --gain 1
 ```
+
+### GRAY8 + MAVLink telemetry (CUAV/PX4/ArduPilot)
+
+```bash
+python tools/baumer_record_headless.py \
+  --backend gst-raw \
+  --pixel-format gray8 \
+  --width 1024 --height 768 \
+  --target-fps 120 --min-fps 100 --max-fps 120 \
+  --duration 10 --exposure-us 9500 --gain 1 \
+  --telemetry-enable \
+  --telemetry-device /dev/ttyACM0 \
+  --telemetry-baud 115200
+```
+
+Если `--telemetry-device` не указан, скрипт пробует автопоиск (`/dev/serial/by-id`, затем `/dev/ttyACM*`, `/dev/ttyUSB*`).
 
 ### Y16, 1024x768
 
@@ -119,7 +136,13 @@ curl -X POST "http://127.0.0.1:8000/api/record/start" \
     "roi_x": 512,
     "roi_y": 384,
     "crop_top": 100,
-    "crop_bottom": 100
+    "crop_bottom": 100,
+    "telemetry_enable": true,
+    "telemetry_device": "/dev/ttyACM0",
+    "telemetry_baud": 115200,
+    "telemetry_wait_heartbeat": 5.0,
+    "telemetry_msg_types": "ATTITUDE,GPS_RAW_INT,GLOBAL_POSITION_INT",
+    "telemetry_max_rate_hz": 0
   }'
 ```
 
@@ -149,6 +172,11 @@ curl -X POST "http://127.0.0.1:8000/api/record/stop"
 
 - `*.raw` — сырые кадры подряд
 - `*.raw.json` — метаданные (`width`, `height`, `bytes_per_pixel`, `fps_from_size`, и т.д.)
+- `*.raw.timestamps.csv` — timestamp на каждый кадр (`mono_ns`, `unix_ns`, `utc_iso`)
+- `*.raw.timestamps.json` — метаданные timestamp-интерполяции
+- `*.raw.telemetry.jsonl` — поток MAVLink сообщений с timestamp
+- `*.raw.telemetry.csv` — плоский CSV телеметрии
+- `*.raw.telemetry.meta.json` — метаданные телеметрии
 
 ## Просмотр RAW
 
@@ -199,10 +227,11 @@ sudo nano /etc/default/baumer_recorder
 - `CROP_TOP`, `CROP_BOTTOM`, `CROP_LEFT`, `CROP_RIGHT`
 - `CAMERA_ID`, `DEVICE`
 - `SNAPSHOT_DIR`
+- `TELEMETRY_ENABLE`, `TELEMETRY_DEVICE`, `TELEMETRY_BAUD`
+- `TELEMETRY_WAIT_HEARTBEAT`, `TELEMETRY_MSG_TYPES`, `TELEMETRY_MAX_RATE_HZ`
 
 Перезапуск после изменения конфига:
 
 ```bash
 sudo systemctl restart baumer_recorder.service
 ```
-

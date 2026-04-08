@@ -54,6 +54,17 @@ def _env_opt_int(name: str) -> Optional[int]:
         return None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    if not v:
+        return bool(default)
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
+
 def _python_bin() -> str:
     env_py = os.getenv("PYTHON_BIN", "").strip()
     if env_py:
@@ -85,6 +96,12 @@ DEFAULTS: Dict[str, Any] = {
     "camera_id": _env_str("CAMERA_ID", ""),
     "device": _env_str("DEVICE", ""),
     "snapshot_dir": _env_str("SNAPSHOT_DIR", str(REPO_DIR / "capture")),
+    "telemetry_enable": _env_bool("TELEMETRY_ENABLE", False),
+    "telemetry_device": _env_str("TELEMETRY_DEVICE", ""),
+    "telemetry_baud": _env_int("TELEMETRY_BAUD", 115200),
+    "telemetry_wait_heartbeat": _env_float("TELEMETRY_WAIT_HEARTBEAT", 5.0),
+    "telemetry_msg_types": _env_str("TELEMETRY_MSG_TYPES", ""),
+    "telemetry_max_rate_hz": _env_float("TELEMETRY_MAX_RATE_HZ", 0.0),
 }
 
 
@@ -109,6 +126,12 @@ class RecordRequest(BaseModel):
     camera_id: Optional[str] = None
     device: Optional[str] = None
     snapshot_dir: Optional[str] = None
+    telemetry_enable: Optional[bool] = None
+    telemetry_device: Optional[str] = None
+    telemetry_baud: Optional[int] = None
+    telemetry_wait_heartbeat: Optional[float] = None
+    telemetry_msg_types: Optional[str] = None
+    telemetry_max_rate_hz: Optional[float] = None
 
 
 class RecorderState:
@@ -192,6 +215,18 @@ def _build_cmd(data: Dict[str, Any]) -> List[str]:
         cmd += ["--camera-id", str(data["camera_id"]).strip()]
     if str(data.get("device") or "").strip():
         cmd += ["--device", str(data["device"]).strip()]
+    if bool(data.get("telemetry_enable", False)):
+        cmd += ["--telemetry-enable"]
+    if str(data.get("telemetry_device") or "").strip():
+        cmd += ["--telemetry-device", str(data["telemetry_device"]).strip()]
+    if data.get("telemetry_baud") is not None:
+        cmd += ["--telemetry-baud", str(int(data["telemetry_baud"]))]
+    if data.get("telemetry_wait_heartbeat") is not None:
+        cmd += ["--telemetry-wait-heartbeat", str(float(data["telemetry_wait_heartbeat"]))]
+    if str(data.get("telemetry_msg_types") or "").strip():
+        cmd += ["--telemetry-msg-types", str(data["telemetry_msg_types"]).strip()]
+    if data.get("telemetry_max_rate_hz") is not None:
+        cmd += ["--telemetry-max-rate-hz", str(float(data["telemetry_max_rate_hz"]))]
     return cmd
 
 
