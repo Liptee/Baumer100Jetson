@@ -102,6 +102,12 @@ DEFAULTS: Dict[str, Any] = {
     "telemetry_wait_heartbeat": _env_float("TELEMETRY_WAIT_HEARTBEAT", 5.0),
     "telemetry_msg_types": _env_str("TELEMETRY_MSG_TYPES", ""),
     "telemetry_max_rate_hz": _env_float("TELEMETRY_MAX_RATE_HZ", 0.0),
+    "telemetry_request_streams": _env_str("TELEMETRY_REQUEST_STREAMS", "on"),
+    "telemetry_request_types": _env_str(
+        "TELEMETRY_REQUEST_TYPES",
+        "ATTITUDE,LOCAL_POSITION_NED,GLOBAL_POSITION_INT",
+    ),
+    "telemetry_request_rate_hz": _env_float("TELEMETRY_REQUEST_RATE_HZ", 50.0),
 }
 
 
@@ -132,6 +138,9 @@ class RecordRequest(BaseModel):
     telemetry_wait_heartbeat: Optional[float] = None
     telemetry_msg_types: Optional[str] = None
     telemetry_max_rate_hz: Optional[float] = None
+    telemetry_request_streams: Optional[str] = None
+    telemetry_request_types: Optional[str] = None
+    telemetry_request_rate_hz: Optional[float] = None
 
 
 class RecorderState:
@@ -227,6 +236,12 @@ def _build_cmd(data: Dict[str, Any]) -> List[str]:
         cmd += ["--telemetry-msg-types", str(data["telemetry_msg_types"]).strip()]
     if data.get("telemetry_max_rate_hz") is not None:
         cmd += ["--telemetry-max-rate-hz", str(float(data["telemetry_max_rate_hz"]))]
+    if str(data.get("telemetry_request_streams") or "").strip():
+        cmd += ["--telemetry-request-streams", str(data["telemetry_request_streams"]).strip()]
+    if str(data.get("telemetry_request_types") or "").strip():
+        cmd += ["--telemetry-request-types", str(data["telemetry_request_types"]).strip()]
+    if data.get("telemetry_request_rate_hz") is not None:
+        cmd += ["--telemetry-request-rate-hz", str(float(data["telemetry_request_rate_hz"]))]
     return cmd
 
 

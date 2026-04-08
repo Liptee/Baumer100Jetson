@@ -59,7 +59,10 @@ python tools/baumer_record_headless.py \
   --duration 10 --exposure-us 9500 --gain 1 \
   --telemetry-enable \
   --telemetry-device /dev/ttyACM0 \
-  --telemetry-baud 115200
+  --telemetry-baud 115200 \
+  --telemetry-request-streams on \
+  --telemetry-request-types ATTITUDE,LOCAL_POSITION_NED,GLOBAL_POSITION_INT \
+  --telemetry-request-rate-hz 50
 ```
 
 Если `--telemetry-device` не указан, скрипт пробует автопоиск (`/dev/serial/by-id`, затем `/dev/ttyACM*`, `/dev/ttyUSB*`).
@@ -142,7 +145,10 @@ curl -X POST "http://127.0.0.1:8000/api/record/start" \
     "telemetry_baud": 115200,
     "telemetry_wait_heartbeat": 5.0,
     "telemetry_msg_types": "ATTITUDE,GPS_RAW_INT,GLOBAL_POSITION_INT",
-    "telemetry_max_rate_hz": 0
+    "telemetry_max_rate_hz": 0,
+    "telemetry_request_streams": "on",
+    "telemetry_request_types": "ATTITUDE,LOCAL_POSITION_NED,GLOBAL_POSITION_INT",
+    "telemetry_request_rate_hz": 50
   }'
 ```
 
@@ -229,6 +235,9 @@ sudo nano /etc/default/baumer_recorder
 - `SNAPSHOT_DIR`
 - `TELEMETRY_ENABLE`, `TELEMETRY_DEVICE`, `TELEMETRY_BAUD`
 - `TELEMETRY_WAIT_HEARTBEAT`, `TELEMETRY_MSG_TYPES`, `TELEMETRY_MAX_RATE_HZ`
+- `TELEMETRY_REQUEST_STREAMS`, `TELEMETRY_REQUEST_TYPES`, `TELEMETRY_REQUEST_RATE_HZ`
+
+Примечание: строки `HEARTBEAT`/`TIMESYNC` в CSV могут иметь пустые `lat/lon/roll/pitch` — это нормально, у этих сообщений нет таких полей. Для заполнения нужных колонок включайте `ATTITUDE`, `LOCAL_POSITION_NED`, `GLOBAL_POSITION_INT`.
 
 Перезапуск после изменения конфига:
 

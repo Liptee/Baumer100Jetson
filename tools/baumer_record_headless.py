@@ -650,6 +650,9 @@ class TelemetryCollector:
         wait_heartbeat_s: float,
         message_types: str,
         max_rate_hz: float,
+        request_streams: bool,
+        request_types: str,
+        request_rate_hz: float,
     ) -> None:
         self.enabled = bool(enabled)
         self.base_path = base_path
@@ -660,6 +663,11 @@ class TelemetryCollector:
         self.msg_filter = {
             x.strip().upper() for x in str(message_types or "").split(",") if x.strip()
         }
+        self.request_streams = bool(request_streams)
+        self.request_rate_hz = float(request_rate_hz)
+        self.request_types = [
+            x.strip().upper() for x in str(request_types or "").split(",") if x.strip()
+        ]
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.error: str = ""
@@ -738,6 +746,52 @@ class TelemetryCollector:
             self.error = f"pymavlink import failed: {exc}"
             return
 
+        def _msg_name_to_id(name: str) -> Optional[int]:
+            n = str(name or "").strip().upper()
+            if not n:
+                return None
+            if n.startswith("MAVLINK_MSG_ID_"):
+                n = n[len("MAVLINK_MSG_ID_") :]
+            key = f"MAVLINK_MSG_ID_{n}"
+            try:
+                return int(getattr(mavutil.mavlink, key))
+            except Exception:
+                return None
+
+        def _request_message_interval(conn, msg_name: str, hz: float) -> bool:
+            msg_id = _msg_name_to_id(msg_name)
+            if msg_id is None:
+                log(f"telemetry request skip: unknown MAVLink message '{msg_name}'")
+                return False
+            if hz <= 0.0:
+                interval_us = -1  # stop stream
+            else:
+                interval_us = max(1, int(round(1_000_000.0 / hz)))
+            tgt_sys = int(getattr(conn, "target_system", 0) or 0) or 1
+            tgt_comp = int(getattr(conn, "target_component", 0) or 0) or 1
+            try:
+                conn.mav.command_long_send(
+                    tgt_sys,
+                    tgt_comp,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    float(msg_id),
+                    float(interval_us),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                log(
+                    f"telemetry request sent: {msg_name} id={msg_id} "
+                    f"interval_us={interval_us} target={tgt_sys}:{tgt_comp}"
+                )
+                return True
+            except Exception as exc:
+                log(f"telemetry request failed for {msg_name}: {exc}")
+                return False
+
         conn = None
         json_fh = None
         csv_fh = None
@@ -787,6 +841,17 @@ class TelemetryCollector:
                     log("telemetry heartbeat timeout; continue without heartbeat")
             else:
                 self.connected = True
+
+            if self.request_streams and self.request_types:
+                req_hz = self.request_rate_hz if self.request_rate_hz > 0.0 else 20.0
+                ok_cnt = 0
+                for name in self.request_types:
+                    if _request_message_interval(conn, name, req_hz):
+                        ok_cnt += 1
+                log(
+                    f"telemetry stream request: requested={len(self.request_types)} "
+                    f"accepted_send={ok_cnt} rate_hz={req_hz:.1f}"
+                )
 
             idx = 0
             while not self.stop_event.is_set() and not STOP_REQUESTED.is_set():
@@ -1566,6 +1631,23 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Optional per-message-type max output rate (0 disables throttling)",
     )
+    p.add_argument(
+        "--telemetry-request-streams",
+        choices=["on", "off"],
+        default="on",
+        help="Actively request MAVLink streams from FC (MAV_CMD_SET_MESSAGE_INTERVAL)",
+    )
+    p.add_argument(
+        "--telemetry-request-types",
+        default="ATTITUDE,LOCAL_POSITION_NED,GLOBAL_POSITION_INT",
+        help="Comma-separated MAVLink message names to request from FC",
+    )
+    p.add_argument(
+        "--telemetry-request-rate-hz",
+        type=float,
+        default=50.0,
+        help="Requested rate for telemetry-request-types",
+    )
     return p.parse_args()
 
 
@@ -1654,6 +1736,9 @@ def main() -> int:
             wait_heartbeat_s=float(args.telemetry_wait_heartbeat),
             message_types=str(args.telemetry_msg_types),
             max_rate_hz=float(args.telemetry_max_rate_hz),
+            request_streams=(str(args.telemetry_request_streams).lower() != "off"),
+            request_types=str(args.telemetry_request_types),
+            request_rate_hz=float(args.telemetry_request_rate_hz),
         )
         try:
             telemetry.start()
@@ -1753,6 +1838,9 @@ def main() -> int:
         wait_heartbeat_s=float(args.telemetry_wait_heartbeat),
         message_types=str(args.telemetry_msg_types),
         max_rate_hz=float(args.telemetry_max_rate_hz),
+        request_streams=(str(args.telemetry_request_streams).lower() != "off"),
+        request_types=str(args.telemetry_request_types),
+        request_rate_hz=float(args.telemetry_request_rate_hz),
     )
     try:
         telemetry.start()
