@@ -1,6 +1,7 @@
 # Baumer USB Recorder + FastAPI
 
 Headless-проект для записи RAW-видео с USB-камеры (режимы `GRAY8` и `Y16`) и управления записью через FastAPI.
+В проекте используется только backend `gst-raw`.
 Также поддерживается параллельная запись MAVLink-телеметрии с полетного контроллера по USB/UART.
 
 ## Файлы
@@ -224,7 +225,7 @@ sudo nano /etc/default/baumer_recorder
 Основные переменные:
 
 - `API_HOST`, `API_PORT` — адрес API
-- `BACKEND`, `PIXEL_FORMAT`
+- `PIXEL_FORMAT`
 - `WIDTH`, `HEIGHT`
 - `TARGET_FPS`, `MIN_FPS`, `MAX_FPS`
 - `DURATION`

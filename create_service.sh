@@ -22,7 +22,6 @@ if [[ ! -f "$ENV_PATH" ]]; then
 PYTHON_BIN=${REPO_DIR}/.venv/bin/python
 API_HOST=0.0.0.0
 API_PORT=8000
-BACKEND=gst-raw
 PIXEL_FORMAT=gray8
 WIDTH=1024
 HEIGHT=768

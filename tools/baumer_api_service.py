@@ -76,7 +76,7 @@ def _python_bin() -> str:
 
 
 DEFAULTS: Dict[str, Any] = {
-    "backend": _env_str("BACKEND", "gst-raw"),
+    "backend": "gst-raw",
     "pixel_format": _env_str("PIXEL_FORMAT", "gray8"),
     "width": _env_int("WIDTH", 1024),
     "height": _env_int("HEIGHT", 768),
@@ -184,7 +184,7 @@ def _build_cmd(data: Dict[str, Any]) -> List[str]:
         _python_bin(),
         str(RECORDER_SCRIPT),
         "--backend",
-        str(data["backend"]),
+        "gst-raw",
         "--pixel-format",
         str(data["pixel_format"]),
         "--width",
@@ -313,6 +313,8 @@ def api_record_start(payload: Optional[RecordRequest] = Body(default=None)) -> D
         raise HTTPException(status_code=500, detail=f"Recorder script not found: {RECORDER_SCRIPT}")
 
     data = _resolve_request(req)
+    if str(data.get("backend", "gst-raw")).strip().lower() != "gst-raw":
+        raise HTTPException(status_code=400, detail="Only gst-raw backend is supported")
     cmd = _build_cmd(data)
 
     with STATE.lock:
